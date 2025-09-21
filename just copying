@@ -1,3 +1,5 @@
+#This code just copy paste from the table from conn_local to table in conn_express
+
 import pyodbc
 
 # ---------- Connections ----------
