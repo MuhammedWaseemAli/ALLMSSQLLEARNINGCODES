@@ -1,0 +1,39 @@
+import pyodbc
+
+# ---------- Connections ----------
+conn_local = pyodbc.connect(
+    "DRIVER={ODBC Driver 17 for SQL Server};"
+    "SERVER=localhost;"
+    "DATABASE=LEARNING;"
+    "Trusted_Connection=yes;"
+)
+conn_express = pyodbc.connect(
+    "DRIVER={ODBC Driver 17 for SQL Server};"
+    "SERVER=localhost\\SQLEXPRESS;"
+    "DATABASE=MyDatabase;"
+    "Trusted_Connection=yes;"
+)
+
+cursor_local = conn_local.cursor()
+cursor_express = conn_express.cursor()
+
+# ---------- Step 1: Get source data ----------
+cursor_express.execute("SELECT * FROM dbo.CurrentWeek")
+rows = cursor_express.fetchall()
+columns = [col[0] for col in cursor_express.description]
+
+# ---------- Step 2: Insert into destination ----------
+placeholders = ",".join("?" * len(columns))
+insert_sql = f"INSERT INTO dbo.EmptyTable VALUES ({placeholders})"
+
+for row in rows:
+    cursor_local.execute(insert_sql, row)
+
+conn_local.commit()
+print(f"Copied {len(rows)} rows into LEARNING.dbo.EmptyTable")
+
+# ---------- Cleanup ----------
+cursor_express.close()
+cursor_local.close()
+conn_express.close()
+conn_local.close()
