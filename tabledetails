@@ -1,0 +1,114 @@
+#This code provides the details of all the tables and the row number and everything of all databases exist in the server selected
+  DECLARE @db NVARCHAR(255);
+DECLARE @sql NVARCHAR(MAX);
+
+-- cursor to loop through user databases
+DECLARE db_cursor CURSOR FOR
+SELECT name 
+FROM sys.databases
+WHERE database_id > 4;  -- exclude system DBs
+
+OPEN db_cursor;
+FETCH NEXT FROM db_cursor INTO @db;
+
+WHILE @@FETCH_STATUS = 0
+BEGIN
+    -- Check if user has access to the database
+    IF HAS_DBACCESS(@db) = 1
+    BEGIN
+        SET @sql = '
+        USE [' + @db + '];
+
+        SELECT
+            SERVERPROPERTY(''MachineName'')     AS MachineName,
+            SERVERPROPERTY(''ServerName'')      AS ServerName,
+            SERVERPROPERTY(''InstanceName'')    AS InstanceName,
+            DB_NAME()                           AS DatabaseName,
+            s.name                              AS SchemaName,
+            t.name                              AS TableName,
+            c.name                              AS ColumnName,
+            tp.name                             AS DataType,
+            c.max_length                        AS MaxLength,
+            c.precision                         AS Precision,
+            c.scale                             AS Scale,
+            c.is_nullable                       AS IsNullable,
+            c.column_id                         AS ColumnID,
+            c.is_identity                       AS IsIdentity,
+            c.is_computed                       AS IsComputed,
+            dc.definition                       AS DefaultValue,
+            pkCol.is_primary_key                AS IsPrimaryKey,
+            fkCol.ReferencedTable               AS ForeignKeyToTable,
+            fkCol.ReferencedColumn              AS ForeignKeyToColumn,
+            c.collation_name                    AS Collation,
+            p.rows                              AS [RowCount],     -- ✅ FIXED: wrap alias
+            ''Has Access''                      AS AccessLevel
+        FROM sys.columns c
+        JOIN sys.tables t   ON c.object_id = t.object_id
+        JOIN sys.schemas s  ON t.schema_id = s.schema_id
+        JOIN sys.types tp   ON c.user_type_id = tp.user_type_id
+        LEFT JOIN sys.default_constraints dc 
+               ON c.default_object_id = dc.object_id
+        LEFT JOIN (
+            SELECT ic.object_id, ic.column_id, 1 AS is_primary_key
+            FROM sys.index_columns ic
+            JOIN sys.indexes i 
+              ON ic.object_id = i.object_id AND ic.index_id = i.index_id
+            WHERE i.is_primary_key = 1
+        ) pkCol ON c.object_id = pkCol.object_id AND c.column_id = pkCol.column_id
+        LEFT JOIN (
+            SELECT 
+                fkc.parent_object_id,
+                fkc.parent_column_id,
+                rt.name AS ReferencedTable,
+                rc.name AS ReferencedColumn
+            FROM sys.foreign_key_columns fkc
+            JOIN sys.tables rt ON fkc.referenced_object_id = rt.object_id
+            JOIN sys.columns rc 
+                 ON fkc.referenced_object_id = rc.object_id
+                AND fkc.referenced_column_id = rc.column_id
+        ) fkCol ON c.object_id = fkCol.parent_object_id AND c.column_id = fkCol.parent_column_id
+        LEFT JOIN (
+            SELECT object_id, SUM(rows) AS rows
+            FROM sys.partitions
+            WHERE index_id IN (0,1)   -- heap or clustered index
+            GROUP BY object_id
+        ) p ON t.object_id = p.object_id
+        ORDER BY DatabaseName, SchemaName, TableName, c.column_id;
+        ';
+
+        PRINT '--- Executing for Database: ' + @db;
+        EXEC sp_executesql @sql;
+    END
+    ELSE
+    BEGIN
+        -- Output one row saying "No Access"
+        SELECT
+            SERVERPROPERTY('MachineName') AS MachineName,
+            SERVERPROPERTY('ServerName')  AS ServerName,
+            SERVERPROPERTY('InstanceName') AS InstanceName,
+            @db AS DatabaseName,
+            NULL AS SchemaName,
+            NULL AS TableName,
+            NULL AS ColumnName,
+            NULL AS DataType,
+            NULL AS MaxLength,
+            NULL AS Precision,
+            NULL AS Scale,
+            NULL AS IsNullable,
+            NULL AS ColumnID,
+            NULL AS IsIdentity,
+            NULL AS IsComputed,
+            NULL AS DefaultValue,
+            NULL AS IsPrimaryKey,
+            NULL AS ForeignKeyToTable,
+            NULL AS ForeignKeyToColumn,
+            NULL AS Collation,
+            NULL AS [RowCount],          
+            'No Access' AS AccessLevel;
+    END
+
+    FETCH NEXT FROM db_cursor INTO @db;
+END
+
+CLOSE db_cursor;
+DEALLOCATE db_cursor;
