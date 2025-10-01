@@ -1,0 +1,138 @@
+import pyodbc
+import sys
+import time
+from datetime import datetime
+
+print("Transfer script started...", flush=True)
+
+try:
+    # ---------- USER INPUTS ----------
+    # Authentication choice
+    auth_type = input(" Authentication type (1 = Windows, 2 = SQL): ").strip()
+
+    # Server/DB names
+    source_server = "Muhammed_waseem\\SQLEXPRESS"
+    source_db = "BigDataDB"
+    dest_server = "Muhammed_waseem"
+    dest_db = "LEARNING"
+
+    # Table names
+    source_table = "TenMillionRowsTable"
+    dest_table = f"{source_table}_Copied_{datetime.now().strftime('%Y%m%d_%H%M%S')}"  # 👈 auto timestamped
+
+    # ---------- CONNECTIONS ----------
+    if auth_type == "1":
+        # Windows Authentication
+        conn_src = pyodbc.connect(
+            f"DRIVER={{ODBC Driver 17 for SQL Server}};"
+            f"SERVER={source_server};"
+            f"DATABASE={source_db};"
+            "Trusted_Connection=yes;"
+        )
+        conn_dest = pyodbc.connect(
+            f"DRIVER={{ODBC Driver 17 for SQL Server}};"
+            f"SERVER={dest_server};"
+            f"DATABASE={dest_db};"
+            "Trusted_Connection=yes;"
+        )
+        print("Using Windows Authentication", flush=True)
+
+    elif auth_type == "2":
+        # SQL Authentication
+        src_user = input(" Enter source SQL username: ")
+        src_pass = input(" Enter source SQL password: ")
+        dest_user = input(" Enter destination SQL username: ")
+        dest_pass = input(" Enter destination SQL password: ")
+
+        conn_src = pyodbc.connect(
+            f"DRIVER={{ODBC Driver 17 for SQL Server}};"
+            f"SERVER={source_server};"
+            f"DATABASE={source_db};"
+            f"UID={src_user};PWD={src_pass};"
+        )
+        conn_dest = pyodbc.connect(
+            f"DRIVER={{ODBC Driver 17 for SQL Server}};"
+            f"SERVER={dest_server};"
+            f"DATABASE={dest_db};"
+            f"UID={dest_user};PWD={dest_pass};"
+        )
+        print(" Using SQL Authentication", flush=True)
+
+    else:
+        print(" Invalid choice. Exiting...")
+        sys.exit(1)
+
+    cursor_src = conn_src.cursor()
+    cursor_dest = conn_dest.cursor()
+
+    # ---------- CREATE DESTINATION TABLE ----------
+    print(f" Dropping destination table `{dest_table}` if it exists...", flush=True)
+    cursor_dest.execute(f"IF OBJECT_ID('dbo.{dest_table}','U') IS NOT NULL DROP TABLE dbo.{dest_table};")
+    conn_dest.commit()
+
+    print(f" Creating destination table `{dest_table}`...", flush=True)
+    create_sql = f"""
+    CREATE TABLE dbo.{dest_table} (
+        ID BIGINT PRIMARY KEY,
+        Name NVARCHAR(200),
+        Location NVARCHAR(200),
+        Height DECIMAL(10,2),
+        Capacity BIGINT,
+        YearBuilt INT,
+        State NVARCHAR(100)
+    );
+    """
+    cursor_dest.execute(create_sql)
+    conn_dest.commit()
+    print(f"Destination table `{dest_table}` created.", flush=True)
+
+    # ---------- DATA TRANSFER ----------
+    batch_size = 50000
+    offset = 0
+    total_inserted = 0
+    start_time = time.time()
+
+    print(" Starting data transfer...", flush=True)
+
+    while True:
+        cursor_src.execute(f"""
+            SELECT ID, Name, Location, Height, Capacity, YearBuilt, State
+            FROM dbo.{source_table}
+            ORDER BY ID
+            OFFSET {offset} ROWS FETCH NEXT {batch_size} ROWS ONLY
+        """)
+        rows = cursor_src.fetchall()
+        if not rows:
+            break
+
+        cursor_dest.fast_executemany = True
+        cursor_dest.executemany(f"""
+            INSERT INTO dbo.{dest_table}
+            (ID, Name, Location, Height, Capacity, YearBuilt, State)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, rows)
+        conn_dest.commit()
+
+        offset += batch_size
+        total_inserted += len(rows)
+        elapsed = time.time() - start_time
+
+        print(f"Batch inserted: {len(rows)} rows (total {total_inserted:,}) in {elapsed:.2f} sec", flush=True)
+
+    print("Transfer complete!")
+    print(f" Total rows inserted into `{dest_table}`: {total_inserted:,}")
+    print(f" Total time: {time.time() - start_time:.2f} sec")
+
+except Exception as e:
+    print(" ERROR:", e, flush=True)
+    sys.exit(1)
+
+finally:
+    try:
+        cursor_src.close()
+        cursor_dest.close()
+        conn_src.close()
+        conn_dest.close()
+        print("Connections closed.")
+    except:
+        pass
