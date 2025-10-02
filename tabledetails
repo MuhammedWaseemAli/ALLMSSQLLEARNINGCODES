@@ -112,3 +112,73 @@ END
 
 CLOSE db_cursor;
 DEALLOCATE db_cursor;
+
+
+2.#DETAILS OF SPECIFIC TABLE IN A DATABSE ( MORE IMPORTANT )
+-- === USER INPUT ===
+DECLARE @DatabaseName NVARCHAR(255) = 'LEARNING';   --  enter database name
+DECLARE @TableName NVARCHAR(255)    = 'EmptyTable';      --  enter table name
+
+DECLARE @sql NVARCHAR(MAX);
+
+SET @sql = '
+USE [' + @DatabaseName + '];
+
+SELECT
+    SERVERPROPERTY(''MachineName'')     AS MachineName,
+    SERVERPROPERTY(''ServerName'')      AS ServerName,
+    SERVERPROPERTY(''InstanceName'')    AS InstanceName,
+    DB_NAME()                           AS DatabaseName,
+    s.name                              AS SchemaName,
+    t.name                              AS TableName,
+    c.name                              AS ColumnName,
+    tp.name                             AS DataType,
+    c.max_length                        AS MaxLength,
+    c.precision                         AS Precision,
+    c.scale                             AS Scale,
+    c.is_nullable                       AS IsNullable,
+    c.column_id                         AS ColumnID,
+    c.is_identity                       AS IsIdentity,
+    c.is_computed                       AS IsComputed,
+    dc.definition                       AS DefaultValue,
+    pkCol.is_primary_key                AS IsPrimaryKey,
+    fkCol.ReferencedTable               AS ForeignKeyToTable,
+    fkCol.ReferencedColumn              AS ForeignKeyToColumn,
+    c.collation_name                    AS Collation,
+    p.rows                              AS [RowCount]
+FROM sys.columns c
+JOIN sys.tables t   ON c.object_id = t.object_id
+JOIN sys.schemas s  ON t.schema_id = s.schema_id
+JOIN sys.types tp   ON c.user_type_id = tp.user_type_id
+LEFT JOIN sys.default_constraints dc 
+       ON c.default_object_id = dc.object_id
+LEFT JOIN (
+    SELECT ic.object_id, ic.column_id, 1 AS is_primary_key
+    FROM sys.index_columns ic
+    JOIN sys.indexes i 
+      ON ic.object_id = i.object_id AND ic.index_id = i.index_id
+    WHERE i.is_primary_key = 1
+) pkCol ON c.object_id = pkCol.object_id AND c.column_id = pkCol.column_id
+LEFT JOIN (
+    SELECT 
+        fkc.parent_object_id,
+        fkc.parent_column_id,
+        rt.name AS ReferencedTable,
+        rc.name AS ReferencedColumn
+    FROM sys.foreign_key_columns fkc
+    JOIN sys.tables rt ON fkc.referenced_object_id = rt.object_id
+    JOIN sys.columns rc 
+         ON fkc.referenced_object_id = rc.object_id
+        AND fkc.referenced_column_id = rc.column_id
+) fkCol ON c.object_id = fkCol.parent_object_id AND c.column_id = fkCol.parent_column_id
+LEFT JOIN (
+    SELECT object_id, SUM(rows) AS rows
+    FROM sys.partitions
+    WHERE index_id IN (0,1)   -- heap or clustered index
+    GROUP BY object_id
+) p ON t.object_id = p.object_id
+WHERE t.name = ''' + @TableName + '''
+ORDER BY SchemaName, TableName, c.column_id;
+';
+
+EXEC sp_executesql @sql;
