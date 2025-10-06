@@ -1,25 +1,22 @@
-#This script need improvement .please check into it .
-
-
 import pyodbc
 import sys
 import time
+import decimal
 from datetime import datetime
 
 def log(msg):
-    """Prints debug messages with timestamps."""
     print(f"[DEBUG {time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
-print("🚀 Transfer script started...\n")
+print(" Transfer script started...\n")
 
 try:
     # ---------- SAVED CONNECTION PROFILES ----------
     profiles = {
-        1: {"source_server": "ServerA\\SQLEXPRESS", "source_db": "BigDataDB", "dest_server": "ServerA",
+        1: {"source_server": r"localhost\SQLEXPRESS", "source_db": "BigDataDB", "dest_server": "localhost",
             "dest_db": "LEARNING", "src_user": "sa", "dest_user": "sa"},
-        2: {"source_server": "ServerB\\TESTSQL", "source_db": "Prod_Data", "dest_server": "ServerB",
+        2: {"source_server": r"ServerB\TESTSQL", "source_db": "Prod_Data", "dest_server": "ServerB",
             "dest_db": "Backup_Data", "src_user": "admin", "dest_user": "backup_user"},
-        3: {"source_server": "ServerC\\MAIN", "source_db": "FinanceDB", "dest_server": "ServerC",
+        3: {"source_server": r"ServerC\MAIN", "source_db": "FinanceDB", "dest_server": "ServerC",
             "dest_db": "ArchiveDB", "src_user": "finance_admin", "dest_user": "archive_admin"}
     }
 
@@ -34,7 +31,6 @@ try:
     log(f"Selected profile {profile_choice}: {profile['source_server']} → {profile['dest_server']}")
 
     # ---------- USER INPUTS ----------
-    auth_type = input(" Authentication type (1 = Windows, 2 = SQL): ").strip()
     source_server = profile["source_server"]
     source_db = profile["source_db"]
     dest_server = profile["dest_server"]
@@ -45,38 +41,53 @@ try:
 
     object_type = input(" What do you want to transfer? (1 = Table, 2 = View): ").strip()
     source_object = input(" Enter the name of the table/view to transfer: ").strip()
-    columns_input = input(" Enter column names to transfer (comma separated), or press ENTER for all columns: ").strip()
     dest_table = f"{source_object}_Copied_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
     # ---------- CONNECTIONS ----------
     log("Establishing database connections...")
-    if auth_type == "1":
+
+    # Source authentication
+    auth_src = input("\n Source Authentication (1 = Windows, 2 = SQL): ").strip()
+    if auth_src == "1":
         conn_src = pyodbc.connect(
             f"DRIVER={{ODBC Driver 17 for SQL Server}};"
             f"SERVER={source_server};DATABASE={source_db};Trusted_Connection=yes;"
         )
+        log(" Source connected using Windows Authentication.")
+    elif auth_src == "2":
+        src_user = profile["src_user"]
+        src_pass = input(f" Enter password for source user '{src_user}': ")
+        conn_src = pyodbc.connect(
+            f"DRIVER={{ODBC Driver 17 for SQL Server}};"
+            f"SERVER={source_server};DATABASE={source_db};UID={src_user};PWD={src_pass};"
+        )
+        log(" Source connected using SQL Authentication.")
+    else:
+        raise Exception("Invalid source authentication type selected.")
+
+    # Destination authentication
+    auth_dest = input("\n Destination Authentication (1 = Windows, 2 = SQL): ").strip()
+    if auth_dest == "1":
         conn_dest = pyodbc.connect(
             f"DRIVER={{ODBC Driver 17 for SQL Server}};"
             f"SERVER={dest_server};DATABASE={dest_db};Trusted_Connection=yes;"
         )
-        log("Connected using Windows Authentication.")
-    elif auth_type == "2":
-        src_pass = input(f" Enter password for source user '{profile['src_user']}': ")
-        dest_pass = input(f" Enter password for destination user '{profile['dest_user']}': ")
-        conn_src = pyodbc.connect(
-            f"DRIVER={{ODBC Driver 17 for SQL Server}};"
-            f"SERVER={source_server};DATABASE={source_db};UID={profile['src_user']};PWD={src_pass};"
-        )
+        log(" Destination connected using Windows Authentication.")
+    elif auth_dest == "2":
+        dest_user = profile["dest_user"]
+        dest_pass = input(f" Enter password for destination user '{dest_user}': ")
         conn_dest = pyodbc.connect(
             f"DRIVER={{ODBC Driver 17 for SQL Server}};"
-            f"SERVER={dest_server};DATABASE={dest_db};UID={profile['dest_user']};PWD={dest_pass};"
+            f"SERVER={dest_server};DATABASE={dest_db};UID={dest_user};PWD={dest_pass};"
         )
-        log("Connected using SQL Authentication.")
+        log(" Destination connected using SQL Authentication.")
     else:
-        raise Exception("Invalid authentication type selected.")
+        raise Exception("Invalid destination authentication type selected.")
 
+    # Create cursors
     cursor_src = conn_src.cursor()
     cursor_dest = conn_dest.cursor()
+    cursor_src.arraysize = 10000
 
     # ---------- DETECT SCHEMA ----------
     log(f"Detecting schema for object: {source_object}")
@@ -100,15 +111,20 @@ try:
     if not all_columns_info:
         raise Exception("No columns detected — object may not exist or permission denied.")
 
-    # ---------- SELECT COLUMNS ----------
-    if columns_input.strip() == "" or columns_input.lower() == "all":
-        selected_columns = [col[0] for col in all_columns_info]
+    print("\n Available columns in the table:")
+    for i, col in enumerate(all_columns_info, start=1):
+        print(f"  {i}. {col[0]} ({col[1]})")
+    print("-" * 60)
+
+    # ---------- COLUMN SELECTION ----------
+    columns_input = input(" Enter column numbers to transfer (comma separated), or press ENTER for all: ").strip()
+    if not columns_input:
+        selected_columns = all_columns_info
         log("All columns selected.")
     else:
-        selected_columns = [c.strip() for c in columns_input.split(',')]
-    columns = [col for col in all_columns_info if col[0] in selected_columns]
-    if not columns:
-        raise Exception("None of the specified columns found in object.")
+        indices = [int(i.strip()) for i in columns_input.split(',') if i.strip().isdigit()]
+        selected_columns = [all_columns_info[i-1] for i in indices if 0 < i <= len(all_columns_info)]
+    columns = selected_columns
     log(f"Columns selected: {', '.join([col[0] for col in columns])}")
 
     # ---------- CREATE DESTINATION TABLE ----------
@@ -127,28 +143,70 @@ try:
             column_defs.append(f"[{col_name}] NVARCHAR(MAX)")
         else:
             column_defs.append(f"[{col_name}] {col_type.upper()}")
-    create_sql = f"CREATE TABLE dbo.{dest_table} ({', '.join(column_defs)});"
-    cursor_dest.execute(create_sql)
+    cursor_dest.execute(f"CREATE TABLE dbo.{dest_table} ({', '.join(column_defs)});")
     conn_dest.commit()
     log(f"Destination table {dest_table} created successfully.")
 
     # ---------- FILTER OPTION ----------
-    filter_type = input(" Do you want to transfer (1 = All rows, 2 = Custom filter): ").strip()
+    filter_type = input("\n Do you want to transfer (1 = All rows, 2 = Custom filter): ").strip()
     where_clause = ""
     if filter_type == "2":
-        filter_input = input(" Enter filters (e.g., country=India,age=24): ").strip()
-        if filter_input:
-            filters = [f.strip() for f in filter_input.split(',')]
-            conditions = []
-            for f in filters:
-                if '=' in f:
-                    col, val = f.split('=', 1)
-                    col, val = col.strip(), val.strip().replace("'", "''")
-                    conditions.append(f"[{col}] = '{val}'")
+        print("\n Columns available for filtering:")
+        for i, col in enumerate(columns, start=1):
+            col_name = col[0]
+            try:
+                cursor_src.execute(f"""
+                    SELECT DISTINCT TOP 10 [{col_name}]
+                    FROM [{source_schema}].[{source_object}]
+                    WHERE [{col_name}] IS NOT NULL
+                    ORDER BY [{col_name}]
+                """)
+                vals = [str(v[0]) for v in cursor_src.fetchall()]
+                preview = ", ".join(vals) if vals else "No data"
+                print(f"  {i}. {col_name} → [{preview}]")
+            except:
+                print(f"  {i}. {col_name} → [Preview unavailable]")
+
+        print("\nAvailable operators: =, !=, >, <, >=, <=, IN")
+        print("Example: City IN ('Delhi','Mumbai'), ID >= 10\n")
+
+        conditions = []
+        while True:
+            col_choice = input("Select column number (or press ENTER to stop): ").strip()
+            if not col_choice:
+                break
+            if not col_choice.isdigit() or not (1 <= int(col_choice) <= len(columns)):
+                print(" Invalid number. Try again.")
+                continue
+            col = columns[int(col_choice) - 1][0]
+
+            operator = input("Enter operator: ").strip().upper()
+            if operator not in ['=', '!=', '>', '<', '>=', '<=', 'IN']:
+                print(" Invalid operator. Try again.")
+                continue
+
+            if operator == 'IN':
+                values = input("Enter values (comma separated): ").strip()
+                vals = [v.strip().strip("'\"") for v in values.split(',') if v.strip()]
+                formatted_vals = ", ".join([f"'{v}'" if not v.replace('.', '', 1).isdigit() else v for v in vals])
+                condition = f"[{col}] IN ({formatted_vals})"
+            else:
+                value = input("Enter value: ").strip().strip("'\"")
+                if not value.replace('.', '', 1).isdigit():
+                    value = f"'{value}'"
+                condition = f"[{col}] {operator} {value}"
+
+            conditions.append(condition)
+            cont = input("Add another condition? (y/n): ").strip().lower()
+            if cont != 'y':
+                break
+
+        if conditions:
             where_clause = "WHERE " + " AND ".join(conditions)
+            print(f"\n Final WHERE clause:\n{where_clause}")
             log(f"Custom filter applied: {where_clause}")
         else:
-            log("No valid filters entered, transferring all data.")
+            log("No filters entered, transferring all data.")
     else:
         log("No filters applied, transferring all rows.")
 
@@ -174,10 +232,15 @@ try:
         rows = cursor_src.fetchall()
         if not rows:
             break
+
+        converted_rows = [
+            tuple(float(v) if isinstance(v, decimal.Decimal) else v for v in row)
+            for row in rows
+        ]
         cursor_dest.fast_executemany = True
         cursor_dest.executemany(
             f"INSERT INTO dbo.{dest_table} ({column_names}) VALUES ({placeholders})",
-            rows
+            converted_rows
         )
         conn_dest.commit()
         offset += batch_size
@@ -185,10 +248,10 @@ try:
         elapsed = time.time() - start_time
         log(f"Batch inserted: {len(rows)} rows (Total: {total_inserted:,}) | Elapsed: {elapsed:.2f} sec")
 
-    log(f"✅ Transfer complete! Total {total_inserted:,} rows inserted in {time.time() - start_time:.2f} sec.")
+    log(f" Transfer complete! Total {total_inserted:,} rows inserted in {time.time() - start_time:.2f} sec.")
 
 except Exception as e:
-    log(f"❌ CRITICAL ERROR: {e}")
+    log(f" CRITICAL ERROR: {e}")
     sys.exit(1)
 
 finally:
@@ -199,4 +262,5 @@ finally:
         conn_dest.close()
         log("Connections closed cleanly.")
     except Exception as close_err:
-        log(f"⚠️ Error while closing connections: {close_err}")
+        log(f" Error while closing connections: {close_err}")
+
