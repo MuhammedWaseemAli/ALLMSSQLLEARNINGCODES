@@ -1,0 +1,202 @@
+#This script need improvement .please check into it .
+
+
+import pyodbc
+import sys
+import time
+from datetime import datetime
+
+def log(msg):
+    """Prints debug messages with timestamps."""
+    print(f"[DEBUG {time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+print("🚀 Transfer script started...\n")
+
+try:
+    # ---------- SAVED CONNECTION PROFILES ----------
+    profiles = {
+        1: {"source_server": "ServerA\\SQLEXPRESS", "source_db": "BigDataDB", "dest_server": "ServerA",
+            "dest_db": "LEARNING", "src_user": "sa", "dest_user": "sa"},
+        2: {"source_server": "ServerB\\TESTSQL", "source_db": "Prod_Data", "dest_server": "ServerB",
+            "dest_db": "Backup_Data", "src_user": "admin", "dest_user": "backup_user"},
+        3: {"source_server": "ServerC\\MAIN", "source_db": "FinanceDB", "dest_server": "ServerC",
+            "dest_db": "ArchiveDB", "src_user": "finance_admin", "dest_user": "archive_admin"}
+    }
+
+    log("Loaded saved connection profiles:")
+    for key, val in profiles.items():
+        print(f" {key}. {val['source_server']} → {val['dest_server']} ({val['source_db']} → {val['dest_db']})")
+
+    profile_choice = int(input("\nSelect connection profile number: ").strip())
+    if profile_choice not in profiles:
+        raise Exception("Invalid profile selected!")
+    profile = profiles[profile_choice]
+    log(f"Selected profile {profile_choice}: {profile['source_server']} → {profile['dest_server']}")
+
+    # ---------- USER INPUTS ----------
+    auth_type = input(" Authentication type (1 = Windows, 2 = SQL): ").strip()
+    source_server = profile["source_server"]
+    source_db = profile["source_db"]
+    dest_server = profile["dest_server"]
+    dest_db = profile["dest_db"]
+
+    print(f"\nUsing profile: {source_server} → {dest_server}")
+    print(f"Databases: {source_db} → {dest_db}")
+
+    object_type = input(" What do you want to transfer? (1 = Table, 2 = View): ").strip()
+    source_object = input(" Enter the name of the table/view to transfer: ").strip()
+    columns_input = input(" Enter column names to transfer (comma separated), or press ENTER for all columns: ").strip()
+    dest_table = f"{source_object}_Copied_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+    # ---------- CONNECTIONS ----------
+    log("Establishing database connections...")
+    if auth_type == "1":
+        conn_src = pyodbc.connect(
+            f"DRIVER={{ODBC Driver 17 for SQL Server}};"
+            f"SERVER={source_server};DATABASE={source_db};Trusted_Connection=yes;"
+        )
+        conn_dest = pyodbc.connect(
+            f"DRIVER={{ODBC Driver 17 for SQL Server}};"
+            f"SERVER={dest_server};DATABASE={dest_db};Trusted_Connection=yes;"
+        )
+        log("Connected using Windows Authentication.")
+    elif auth_type == "2":
+        src_pass = input(f" Enter password for source user '{profile['src_user']}': ")
+        dest_pass = input(f" Enter password for destination user '{profile['dest_user']}': ")
+        conn_src = pyodbc.connect(
+            f"DRIVER={{ODBC Driver 17 for SQL Server}};"
+            f"SERVER={source_server};DATABASE={source_db};UID={profile['src_user']};PWD={src_pass};"
+        )
+        conn_dest = pyodbc.connect(
+            f"DRIVER={{ODBC Driver 17 for SQL Server}};"
+            f"SERVER={dest_server};DATABASE={dest_db};UID={profile['dest_user']};PWD={dest_pass};"
+        )
+        log("Connected using SQL Authentication.")
+    else:
+        raise Exception("Invalid authentication type selected.")
+
+    cursor_src = conn_src.cursor()
+    cursor_dest = conn_dest.cursor()
+
+    # ---------- DETECT SCHEMA ----------
+    log(f"Detecting schema for object: {source_object}")
+    cursor_src.execute(f"""
+        SELECT TABLE_SCHEMA FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = '{source_object}'
+        UNION
+        SELECT TABLE_SCHEMA FROM INFORMATION_SCHEMA.VIEWS WHERE TABLE_NAME = '{source_object}'
+    """)
+    schema_row = cursor_src.fetchone()
+    source_schema = schema_row[0] if schema_row else "dbo"
+    log(f"Schema detected: {source_schema}")
+
+    # ---------- FETCH COLUMN INFO ----------
+    log(f"Fetching column metadata for {source_schema}.{source_object}")
+    cursor_src.execute(f"""
+        SELECT COLUMN_NAME, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH
+        FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA = '{source_schema}' AND TABLE_NAME = '{source_object}'
+    """)
+    all_columns_info = cursor_src.fetchall()
+    if not all_columns_info:
+        raise Exception("No columns detected — object may not exist or permission denied.")
+
+    # ---------- SELECT COLUMNS ----------
+    if columns_input.strip() == "" or columns_input.lower() == "all":
+        selected_columns = [col[0] for col in all_columns_info]
+        log("All columns selected.")
+    else:
+        selected_columns = [c.strip() for c in columns_input.split(',')]
+    columns = [col for col in all_columns_info if col[0] in selected_columns]
+    if not columns:
+        raise Exception("None of the specified columns found in object.")
+    log(f"Columns selected: {', '.join([col[0] for col in columns])}")
+
+    # ---------- CREATE DESTINATION TABLE ----------
+    log(f"Creating destination table {dest_table}")
+    cursor_dest.execute(f"IF OBJECT_ID('dbo.{dest_table}','U') IS NOT NULL DROP TABLE dbo.{dest_table};")
+    conn_dest.commit()
+
+    column_defs = []
+    for col in columns:
+        col_name, col_type, col_len = col
+        if col_type in ('nvarchar', 'varchar') and col_len and col_len > 0:
+            column_defs.append(f"[{col_name}] {col_type}({col_len})")
+        elif col_type in ('nvarchar', 'varchar') and (col_len is None or col_len < 0):
+            column_defs.append(f"[{col_name}] {col_type}(MAX)")
+        elif col_type is None:
+            column_defs.append(f"[{col_name}] NVARCHAR(MAX)")
+        else:
+            column_defs.append(f"[{col_name}] {col_type.upper()}")
+    create_sql = f"CREATE TABLE dbo.{dest_table} ({', '.join(column_defs)});"
+    cursor_dest.execute(create_sql)
+    conn_dest.commit()
+    log(f"Destination table {dest_table} created successfully.")
+
+    # ---------- FILTER OPTION ----------
+    filter_type = input(" Do you want to transfer (1 = All rows, 2 = Custom filter): ").strip()
+    where_clause = ""
+    if filter_type == "2":
+        filter_input = input(" Enter filters (e.g., country=India,age=24): ").strip()
+        if filter_input:
+            filters = [f.strip() for f in filter_input.split(',')]
+            conditions = []
+            for f in filters:
+                if '=' in f:
+                    col, val = f.split('=', 1)
+                    col, val = col.strip(), val.strip().replace("'", "''")
+                    conditions.append(f"[{col}] = '{val}'")
+            where_clause = "WHERE " + " AND ".join(conditions)
+            log(f"Custom filter applied: {where_clause}")
+        else:
+            log("No valid filters entered, transferring all data.")
+    else:
+        log("No filters applied, transferring all rows.")
+
+    # ---------- DATA TRANSFER ----------
+    log("Starting data transfer...")
+    batch_size = 50000
+    offset = 0
+    total_inserted = 0
+    start_time = time.time()
+    column_names = ", ".join([f"[{col[0]}]" for col in columns])
+    placeholders = ", ".join(["?"] * len(columns))
+
+    while True:
+        query = f"""
+            SELECT {column_names}
+            FROM [{source_schema}].[{source_object}]
+            {where_clause}
+            ORDER BY 1
+            OFFSET {offset} ROWS FETCH NEXT {batch_size} ROWS ONLY
+        """
+        log(f"Fetching next batch with OFFSET {offset}")
+        cursor_src.execute(query)
+        rows = cursor_src.fetchall()
+        if not rows:
+            break
+        cursor_dest.fast_executemany = True
+        cursor_dest.executemany(
+            f"INSERT INTO dbo.{dest_table} ({column_names}) VALUES ({placeholders})",
+            rows
+        )
+        conn_dest.commit()
+        offset += batch_size
+        total_inserted += len(rows)
+        elapsed = time.time() - start_time
+        log(f"Batch inserted: {len(rows)} rows (Total: {total_inserted:,}) | Elapsed: {elapsed:.2f} sec")
+
+    log(f"✅ Transfer complete! Total {total_inserted:,} rows inserted in {time.time() - start_time:.2f} sec.")
+
+except Exception as e:
+    log(f"❌ CRITICAL ERROR: {e}")
+    sys.exit(1)
+
+finally:
+    try:
+        cursor_src.close()
+        cursor_dest.close()
+        conn_src.close()
+        conn_dest.close()
+        log("Connections closed cleanly.")
+    except Exception as close_err:
+        log(f"⚠️ Error while closing connections: {close_err}")
