@@ -1,0 +1,152 @@
+#There are problems in this code .most of the coloumn data structure remain as NVARCHAR . so need to be changed in future
+import pyodbc
+import pandas as pd
+import os
+import traceback
+from datetime import datetime
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning)
+
+# =====================================
+# CONFIGURATION
+# =====================================
+SERVER = r"localhost\SQLEXPRESS"
+DATABASE = "BigDataDB"
+CSV_FILES = [
+    r"C:\Usjjjjj1.csv",
+    r"C:\Usersjjjjjjjj.csv"
+]
+LOG_PATH = r"C:\UsejjejjjjL_log.txt"
+
+# =====================================
+# LOGGING
+# =====================================
+def log(msg):
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{timestamp}] {msg}"
+    print(line)
+    with open(LOG_PATH, "a", encoding="utf-8") as f:
+        f.write(line + "\n")
+
+# Clear old logs
+open(LOG_PATH, "w").close()
+log("🚀 Starting Excel-to-SQL Import Process")
+
+# =====================================
+# CONNECT
+# =====================================
+conn_str = (
+    "DRIVER={ODBC Driver 17 for SQL Server};"
+    f"SERVER={SERVER};"
+    f"DATABASE={DATABASE};"
+    "Trusted_Connection=yes;"
+)
+
+def get_connection(autocommit=False):
+    return pyodbc.connect(conn_str, autocommit=autocommit)
+
+conn = get_connection()
+cursor = conn.cursor()
+log(f"✅ Connected to SQL Server: {SERVER}\\{DATABASE}")
+
+# =====================================
+# TYPE DETECTOR
+# =====================================
+def detect_sql_type(series: pd.Series) -> str:
+    if series.dropna().empty:
+        return "NVARCHAR(MAX)"
+    try:
+        pd.to_numeric(series, errors="raise")
+        if all(float(x).is_integer() for x in series.dropna().astype(float)):
+            return "INT"
+        else:
+            return "FLOAT"
+    except Exception:
+        pass
+    try:
+        pd.to_datetime(series, errors="raise", dayfirst=True)
+        return "DATETIME"
+    except Exception:
+        pass
+    return "NVARCHAR(MAX)"
+
+# =====================================
+# SAFE TABLE DROPPER
+# =====================================
+def safe_drop_table(table_name):
+    """Drop table using autocommit mode to avoid transaction blockage."""
+    try:
+        drop_conn = get_connection(autocommit=True)
+        drop_cur = drop_conn.cursor()
+        drop_cur.execute(f"IF OBJECT_ID('{table_name}', 'U') IS NOT NULL DROP TABLE [{table_name}]")
+        drop_conn.commit()
+        drop_cur.close()
+        drop_conn.close()
+        log(f"🧹 Dropped existing table [{table_name}] successfully.")
+    except Exception as e:
+        log(f"⚠️ Could not drop table [{table_name}]: {e}")
+
+# =====================================
+# MAIN IMPORT LOOP
+# =====================================
+for file_path in CSV_FILES:
+    table_name = os.path.splitext(os.path.basename(file_path))[0]
+    log(f"\n📦 Importing {table_name} from {file_path}")
+
+    df = pd.read_csv(file_path, keep_default_na=False)
+    df.columns = [c.replace(' ', '_').replace('-', '_') for c in df.columns]
+    sql_types = {col: detect_sql_type(df[col]) for col in df.columns}
+
+    log("🔍 Detected column types:")
+    for c, t in sql_types.items():
+        log(f"   {c}: {t}")
+
+    safe_drop_table(table_name)
+
+    # Create table
+    create_sql = f"CREATE TABLE [{table_name}] (" + ",".join(
+        [f"[{col}] {sql_types[col]}" for col in df.columns]) + ")"
+    cursor.execute(create_sql)
+    conn.commit()
+    log(f"🧱 Table [{table_name}] created successfully.")
+
+    # Insert
+    insert_sql = f"INSERT INTO [{table_name}] VALUES ({','.join(['?' for _ in df.columns])})"
+    cursor.fast_executemany = True
+
+    try:
+        cursor.executemany(insert_sql, df.where(df.notnull(), None).values.tolist())
+        conn.commit()
+        log(f"✅ {len(df)} rows inserted successfully into [{table_name}].")
+
+    except Exception as e:
+        log(f"⚠️ Insert failed for [{table_name}]: {e}")
+        log("🔁 Rolling back and switching to NVARCHAR(MAX)...")
+
+        conn.rollback()
+        safe_drop_table(table_name)
+
+        # Reconnect fresh to avoid stuck transaction
+        conn.close()
+        conn = get_connection()
+        cursor = conn.cursor()
+
+        # Recreate all NVARCHAR table
+        create_sql = f"CREATE TABLE [{table_name}] (" + ",".join(
+            [f"[{col}] NVARCHAR(MAX)" for col in df.columns]) + ")"
+        cursor.execute(create_sql)
+        conn.commit()
+        log(f"🧱 Recreated [{table_name}] as NVARCHAR(MAX).")
+
+        # Insert all as strings
+        cursor.executemany(insert_sql, df.astype(str).fillna("").values.tolist())
+        conn.commit()
+        log(f"✅ Fallback succeeded! {len(df)} rows inserted into [{table_name}] as NVARCHAR(MAX).")
+
+# =====================================
+# CLOSE CONNECTION
+# =====================================
+cursor.close()
+conn.close()
+log("🏁 Import Process Completed Successfully!")
+print("\n✅ Full debug log saved to:", LOG_PATH)
