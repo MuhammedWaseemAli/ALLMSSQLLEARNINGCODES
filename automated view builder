@@ -1,0 +1,326 @@
+import pyodbc
+import sys
+import time
+
+# =====================================
+#   UTILITY FUNCTIONS
+# =====================================
+def log(msg):
+    """Prints a timestamped debug message."""
+    print(f"[DEBUG {time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+def q(s):
+    """Brackets identifiers safely for SQL use."""
+    if not s:
+        return s
+    return f"[{s.strip('[]')}]"
+
+
+# =====================================
+#   CLASS: SQL View Creator
+# =====================================
+class SQLViewCreator:
+    """
+    Interactive SQL View Builder:
+    - Connects to SQL Server
+    - Uses predefined tables
+    - Performs various SQL operations (JOIN, GROUPBY, CONCAT, etc.)
+    - Generates CREATE OR ALTER VIEW SQL
+    """
+
+    def __init__(self, label, server, database, auth_type="windows", user=None, preselected_tables=None):
+        self.label = label
+        self.server = server
+        self.database = database
+        self.auth_type = auth_type.lower()
+        self.user = user
+        self.conn = None
+        self.cursor = None
+        self.selected_tables = []
+        self.join_clauses = []
+        self.final_columns = []
+        self.preselected_tables = preselected_tables or []
+
+    # ---------- CONNECTION ----------
+    def connect(self):
+        """Establish connection."""
+        log(f"Connecting to [{self.label}] | Server: {self.server} | DB: {self.database} | Auth: {self.auth_type.upper()}")
+        try:
+            if self.auth_type == "windows":
+                self.conn = pyodbc.connect(
+                    f"DRIVER={{ODBC Driver 17 for SQL Server}};"
+                    f"SERVER={self.server};DATABASE={self.database};Trusted_Connection=yes;"
+                )
+                log("Connected via Windows Authentication ✅")
+
+            elif self.auth_type == "sql":
+                if not self.user:
+                    raise ValueError("Username is required for SQL Authentication.")
+                pwd = input(f"Enter password for SQL user '{self.user}' on {self.server}: ")
+                self.conn = pyodbc.connect(
+                    f"DRIVER={{ODBC Driver 17 for SQL Server}};"
+                    f"SERVER={self.server};DATABASE={self.database};UID={self.user};PWD={pwd};"
+                )
+                log("Connected via SQL Authentication ✅")
+
+            self.cursor = self.conn.cursor()
+        except Exception as e:
+            log(f"❌ Connection failed: {e}")
+            sys.exit(1)
+
+    # ---------- COLUMN FETCH ----------
+    def list_columns(self, schema, table):
+        """Return columns of a table."""
+        try:
+            self.cursor.execute("""
+                SELECT COLUMN_NAME, DATA_TYPE
+                FROM INFORMATION_SCHEMA.COLUMNS
+                WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
+                ORDER BY ORDINAL_POSITION;
+            """, (schema, table))
+            return self.cursor.fetchall()
+        except Exception as e:
+            log(f"❌ Could not fetch columns for {table}: {e}")
+            return []
+
+    # ---------- TABLE SELECTION ----------
+    def select_tables(self):
+        """Use predefined tables only (no need for manual selection)."""
+        if not self.preselected_tables:
+            log("⚠️ No predefined tables provided.")
+            return
+
+        for i, t in enumerate(self.preselected_tables, start=1):
+            schema = t.get("schema", "dbo")
+            table = t["table"]
+            cols = self.list_columns(schema, table)
+            print(f"\nColumns in {schema}.{table}:")
+            for j, (col, dtype) in enumerate(cols, 1):
+                print(f"  {j:3}. {col:<25} ({dtype})")
+
+            self.selected_tables.append({
+                "schema": schema,
+                "table": table,
+                "alias": f"T{i}",
+                "columns": [col for col, _ in cols]
+            })
+
+        log("✅ Predefined table selection complete.")
+
+    # ===========================================================
+    #   FUNCTION MENU (NEW)
+    # ===========================================================
+    def operation_menu(self):
+        """Menu-driven selection for SQL operations."""
+        print("\n======= AVAILABLE OPERATIONS =======")
+        print("1. JOIN Tables")
+        print("2. GROUPBY Aggregation")
+        print("3. CONCAT Columns")
+        print("4. FILTER (WHERE condition)")
+        print("5. UNION / MERGE")
+        print("6. EXIT")
+        print("====================================")
+
+        choice = input("Select an operation: ").strip()
+        function_map = {
+            "1": self.build_joins,
+            "2": self.groupby_operation,
+            "3": self.concat_operation,
+            "4": self.filter_operation,
+            "5": self.union_operation,
+            "6": self.exit_operation
+        }
+
+        func = function_map.get(choice)
+        if func:
+            func()
+        else:
+            log("⚠️ Invalid choice. Please select again.")
+            self.operation_menu()
+
+    # ===========================================================
+    #   OPERATION PLACEHOLDERS (YOU CAN FILL LATER)
+    # ===========================================================
+    def groupby_operation(self):
+        """Placeholder for GROUPBY logic."""
+        log("🧮 GROUPBY operation selected. (To be implemented)")
+
+    def concat_operation(self):
+        """Placeholder for CONCAT logic."""
+        log("🔗 CONCAT operation selected. (To be implemented)")
+
+    def filter_operation(self):
+        """Placeholder for FILTER logic."""
+        log("🔍 FILTER operation selected. (To be implemented)")
+
+    def union_operation(self):
+        """Placeholder for UNION logic."""
+        log("🧩 UNION operation selected. (To be implemented)")
+
+    def exit_operation(self):
+        """Exit the menu."""
+        log("👋 Exiting operation menu.")
+        return
+
+    # ===========================================================
+    #   EXISTING JOIN LOGIC (UNCHANGED)
+    # ===========================================================
+    def build_joins(self):
+        """Let the user define joins between selected tables."""
+        if len(self.selected_tables) < 2:
+            log("Need at least two tables to perform joins.")
+            return
+
+        print("\nAvailable JOIN types: INNER, LEFT, RIGHT, FULL")
+        join_type = input("Enter JOIN type: ").strip().upper() or "INNER"
+
+        for i in range(len(self.selected_tables) - 1):
+            left = self.selected_tables[i]
+            right = self.selected_tables[i + 1]
+
+            print(f"\nJoining {left['schema']}.{left['table']} ({left['alias']}) ↔ {right['schema']}.{right['table']} ({right['alias']})")
+
+            print("\nColumns in LEFT table:")
+            for j, col in enumerate(left["columns"], 1):
+                print(f"  {j:3}. {col}")
+
+            left_choices = input("Enter join column number(s) from LEFT table (comma-separated): ").strip()
+            left_indices = [int(x) for x in left_choices.split(",") if x.strip().isdigit()]
+            left_cols = [left["columns"][n - 1] for n in left_indices if 1 <= n <= len(left["columns"])]
+
+            print("\nColumns in RIGHT table:")
+            for j, col in enumerate(right["columns"], 1):
+                print(f"  {j:3}. {col}")
+
+            right_choices = input("Enter join column number(s) from RIGHT table (comma-separated): ").strip()
+            right_indices = [int(x) for x in right_choices.split(",") if x.strip().isdigit()]
+            right_cols = [right["columns"][n - 1] for n in right_indices if 1 <= n <= len(right["columns"])]
+
+            if len(left_cols) != len(right_cols):
+                log("⚠️ Join column counts don't match — only pairing first available.")
+                pairs = [(left_cols[0], right_cols[0])]
+            else:
+                pairs = zip(left_cols, right_cols)
+
+            for lcol, rcol in pairs:
+                clause = f"{join_type} JOIN {q(right['schema'])}.{q(right['table'])} {right['alias']} ON {left['alias']}.{q(lcol)} = {right['alias']}.{q(rcol)}"
+                self.join_clauses.append(clause)
+                log(f"Added JOIN: {clause}")
+
+        log("✅ Join definitions complete.")
+
+        # Proceed to column selection and view creation
+        self.select_columns_for_view()
+        self.generate_view_sql()
+
+    # ---------- COLUMN SELECTION ----------
+    def select_columns_for_view(self):
+        """Choose which columns to include in the final view."""
+        print("\nSelect which columns to include in the view:")
+        for t in self.selected_tables:
+            print(f"\nFrom {t['schema']}.{t['table']} ({t['alias']}):")
+            for i, col in enumerate(t["columns"], 1):
+                print(f"  {i:3}. {col}")
+            choice = input(f"Enter column numbers (comma separated) from this table to include: ").strip()
+            if choice:
+                nums = [int(x) for x in choice.split(",") if x.strip().isdigit()]
+                for n in nums:
+                    if 1 <= n <= len(t["columns"]):
+                        self.final_columns.append(f"{t['alias']}.{q(t['columns'][n-1])}")
+
+        log("✅ Column selection for view complete.")
+
+    # ---------- SQL VIEW CREATION ----------
+    def generate_view_sql(self):
+        """Generate final CREATE OR ALTER VIEW SQL."""
+        if not self.selected_tables or not self.final_columns:
+            log("No tables or columns selected.")
+            return
+
+        view_name = input("\nEnter new view name (e.g., dbo.MyJoinedView): ").strip()
+        if "." not in view_name:
+            view_name = f"dbo.{view_name}"
+
+        base_table = self.selected_tables[0]
+        from_clause = f"{q(base_table['schema'])}.{q(base_table['table'])} {base_table['alias']}"
+        join_text = "\n    ".join(self.join_clauses)
+        col_text = ", ".join(self.final_columns)
+
+        sql = f"""
+CREATE OR ALTER VIEW {view_name} AS
+SELECT {col_text}
+FROM {from_clause}
+    {join_text};
+""".strip()
+
+        print("\n======= GENERATED SQL VIEW =======")
+        print(sql)
+        print("==================================")
+
+        confirm = input("Do you want to create this view in SQL Server? (y/n): ").strip().lower()
+        if confirm == "y":
+            try:
+                self.cursor.execute(sql)
+                self.conn.commit()
+                log(f"✅ View '{view_name}' created successfully.")
+            except Exception as e:
+                log(f"❌ Failed to create view: {e}")
+        else:
+            log("View creation canceled.")
+
+    # ---------- CLOSE ----------
+    def close(self):
+        """Safely close the connection."""
+        try:
+            if self.cursor:
+                self.cursor.close()
+            if self.conn:
+                self.conn.close()
+            log(f"[{self.label}] Connection closed successfully.")
+        except Exception as e:
+            log(f"⚠️ Error closing connection: {e}")
+
+
+# =====================================
+#   MAIN EXECUTION
+# =====================================
+if __name__ == "__main__":
+    servers = [
+        {
+            "label": "Local BigDataDB (View Builder)",
+            "server": r"localhost\SQLEXPRESS",
+            "database": "BigDataDB",
+            "auth_type": "windows",
+            "user": None,
+            "tables": [
+                {"schema": "dbo", "table": "SORTED1"},
+                {"schema": "dbo", "table": "SORTED2"}
+            ],
+        }
+    ]
+
+    print("\n======= AVAILABLE SERVERS =======")
+    for i, s in enumerate(servers, 1):
+        print(f"{i}. {s['label']} ({s['auth_type']})")
+    print("================================\n")
+
+    selection = input("Select server numbers (comma-separated or 'all'): ").strip().lower()
+    if selection == "all":
+        selected_indices = list(range(1, len(servers) + 1))
+    else:
+        selected_indices = [int(x) for x in selection.split(",") if x.strip().isdigit()]
+
+    for idx in selected_indices:
+        if idx < 1 or idx > len(servers):
+            log(f"⚠️ Invalid selection: {idx}")
+            continue
+
+        s = servers[idx - 1]
+        log(f"\n🚀 Starting workflow for: {s['label']}")
+        app = SQLViewCreator(s["label"], s["server"], s["database"], s["auth_type"], s["user"], s["tables"])
+        app.connect()
+        app.select_tables()
+        app.operation_menu()   # ✅ New Menu for Selecting Operation
+        app.close()
+
+    print("\n✅ All selected servers processed successfully.")
