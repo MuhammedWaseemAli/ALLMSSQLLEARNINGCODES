@@ -1,0 +1,817 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+JOIN-ONLY VIEW MAKER (Grain-Preserving, Original Column Names)
+===============================================================================
+- Connection logic unchanged (Windows/SQL auth).
+- Join-only workflow with proper sequence
+- Column names kept EXACTLY as original - NO modifications
+- Clear flow: Join Type → Cardinality → Keys → Columns → Collapse (if needed)
+"""
+
+import pyodbc
+import sys
+import time
+import re
+from dataclasses import dataclass, field
+from typing import List, Dict, Tuple, Optional, Any
+
+# =========================
+# Logger
+# =========================
+class Logger:
+    @staticmethod
+    def info(msg: str):    print(f"[INFO {time.strftime('%H:%M:%S')}] {msg}", flush=True)
+    @staticmethod
+    def success(msg: str): print(f"[✅ SUCCESS {time.strftime('%H:%M:%S')}] {msg}", flush=True)
+    @staticmethod
+    def warning(msg: str): print(f"[⚠️  WARNING {time.strftime('%H:%M:%S')}] {msg}", flush=True)
+    @staticmethod
+    def error(msg: str):   print(f"[❌ ERROR {time.strftime('%H:%M:%S')}] {msg}", flush=True)
+    @staticmethod
+    def debug(msg: str):   print(f"[🔍 DEBUG {time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+# =========================
+# SQL helpers
+# =========================
+class SQLHelper:
+    @staticmethod
+    def q_ident(identifier: str) -> str:
+        if identifier is None:
+            return identifier
+        if "." in identifier and not identifier.strip().startswith("["):
+            parts = [p.strip("[] ") for p in identifier.split(".")]
+            return ".".join(f"[{p}]" for p in parts)
+        return f"[{identifier.strip('[]')}]"
+
+    @staticmethod
+    def q_lit(value: Any) -> str:
+        if value is None: return "NULL"
+        s = str(value)
+        if re.fullmatch(r"-?\d+(?:\.\d+)?", s):
+            return s
+        return "'" + s.replace("'", "''") + "'"
+
+# =========================
+# Data models
+# =========================
+@dataclass
+class ColumnInfo:
+    name: str
+    data_type: str = ""
+    selected: bool = True
+
+@dataclass
+class SourceTable:
+    schema: str
+    table: str
+    alias: str
+    columns: List[ColumnInfo] = field(default_factory=list)
+
+    @property
+    def fqtn(self) -> str:
+        return f"{SQLHelper.q_ident(self.schema)}.{SQLHelper.q_ident(self.table)}"
+
+    def selected_columns(self) -> List[ColumnInfo]:
+        return [c for c in self.columns if c.selected]
+
+    def column_names(self) -> List[str]:
+        return [c.name for c in self.columns]
+
+# =========================
+# DB connection
+# =========================
+class DatabaseConnection:
+    def __init__(self, label: str, server: str, database: str, auth_type: str = "windows", user: Optional[str] = None):
+        self.label = label; self.server = server; self.database = database
+        self.auth_type = auth_type.lower(); self.user = user
+        self.conn = None; self.cursor = None
+
+    def connect(self):
+        Logger.info(f"Connecting to [{self.label}]")
+        Logger.debug(f"Server={self.server} | DB={self.database} | Auth={self.auth_type.upper()}")
+        try:
+            if self.auth_type == "windows":
+                conn_str = f"DRIVER={{ODBC Driver 17 for SQL Server}};SERVER={self.server};DATABASE={self.database};Trusted_Connection=yes;"
+                self.conn = pyodbc.connect(conn_str)
+                Logger.success("Connected via Windows Authentication")
+            elif self.auth_type == "sql":
+                if not self.user:
+                    raise ValueError("Username required for SQL Authentication")
+                import getpass
+                pwd = getpass.getpass(f"Password for {self.user}@{self.server}: ")
+                conn_str = f"DRIVER={{ODBC Driver 17 for SQL Server}};SERVER={self.server};DATABASE={self.database};UID={self.user};PWD={pwd};"
+                self.conn = pyodbc.connect(conn_str)
+                Logger.success("Connected via SQL Authentication")
+            self.cursor = self.conn.cursor()
+        except Exception as e:
+            Logger.error(f"Connection failed: {e}")
+            raise
+
+    def close(self):
+        try:
+            if self.cursor: self.cursor.close()
+            if self.conn:   self.conn.close()
+            Logger.success(f"[{self.label}] Connection closed")
+        except Exception as e:
+            Logger.warning(f"Error closing connection: {e}")
+
+    def list_columns(self, schema: str, table: str) -> List[Tuple[str, str]]:
+        try:
+            sql = """
+                SELECT COLUMN_NAME, DATA_TYPE
+                FROM INFORMATION_SCHEMA.COLUMNS
+                WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
+                ORDER BY ORDINAL_POSITION
+            """
+            self.cursor.execute(sql, (schema, table))
+            rows = self.cursor.fetchall()
+            return [(r[0], r[1]) for r in rows]
+        except Exception as e:
+            Logger.warning(f"Metadata fetch failed for {schema}.{table}: {e}")
+            return []
+
+    def scalar(self, sql: str) -> Optional[int]:
+        try:
+            self.cursor.execute(sql)
+            r = self.cursor.fetchone()
+            return r[0] if r else None
+        except Exception as e:
+            Logger.warning(f"Scalar failed: {e}")
+            return None
+
+# =========================
+# Utility: synthetic columns
+# =========================
+def synthetic_columns_for(alias: str) -> List[ColumnInfo]:
+    if not alias.upper().startswith("T"):
+        return []
+    try:
+        i = int(alias[1:])
+        start = 10 * (i - 1) + 1 + (i - 1)
+        end = start + 9
+        cols = [ColumnInfo(name=f"{alias}C{n}") for n in range(start, end + 1)]
+        return cols
+    except:
+        return []
+
+# =========================
+# View builder
+# =========================
+class JoinOnlyViewBuilder:
+    def __init__(self, db: DatabaseConnection, tables: List[Dict], view_name: str = "dbo.V"):
+        self.db = db
+        self.catalog: Dict[str, SourceTable] = {}
+        self.view_name = view_name
+        self.base_alias: Optional[str] = None
+        self.base_table_keyset: set[str] = set()
+        self.join_plan: List[Dict] = []
+
+        for i, t in enumerate(tables, 1):
+            sch = t.get("schema", "dbo")
+            tbl = t["table"]
+            alias = t.get("alias", f"T{i}")
+            cols_meta = self.db.list_columns(sch, tbl)
+            if cols_meta:
+                cols = [ColumnInfo(name=n, data_type=dt) for n, dt in cols_meta]
+            else:
+                cols = synthetic_columns_for(alias)
+            self.catalog[alias] = SourceTable(schema=sch, table=tbl, alias=alias, columns=cols)
+            Logger.success(f"Loaded {alias}: {sch}.{tbl} ({len(cols)} columns)")
+
+    # ---------- PROMPTS ----------
+    def _prompt_base(self):
+        print("\n" + "="*80)
+        print("STEP 1: SELECT BASE TABLE")
+        print("="*80)
+        print("\n📦 Available tables:")
+        for a, s in self.catalog.items():
+            print(f"  • {a}: {s.schema}.{s.table}")
+        base = input("\n🎯 Choose BASE table alias (e.g., T1): ").strip() or "T1"
+        if base not in self.catalog:
+            raise ValueError("Invalid base alias")
+        self.base_alias = base
+        Logger.success(f"Base table set: {base}")
+        self._pick_columns(self.base_alias, must_pick=True)
+
+    def _pick_columns(self, alias: str, must_pick: bool = False):
+        src = self.catalog[alias]
+        cols = src.columns
+        print(f"\n{'='*80}")
+        print(f"SELECT COLUMNS FROM {alias} ({src.schema}.{src.table})")
+        print("="*80)
+        for idx, c in enumerate(cols, 1):
+            dt = f" ({c.data_type})" if c.data_type else ""
+            print(f"  {idx:2}. {c.name}{dt}")
+        
+        msg = "\n📋 Select columns to DISPLAY (comma-separated numbers, or 'all'): "
+        if must_pick:
+            msg = "\n📋 Select BASE columns to DISPLAY (comma-separated numbers, or 'all'): "
+        sel = input(msg).strip().lower()
+        
+        if sel == "all" or not sel:
+            for c in cols: c.selected = True
+        else:
+            keep_idx = {int(x.strip()) for x in sel.split(",") if x.strip().isdigit()}
+            for i, c in enumerate(cols, 1):
+                c.selected = (i in keep_idx)
+        
+        kept = sum(1 for c in cols if c.selected)
+        Logger.success(f"{alias}: Selected {kept}/{len(cols)} columns")
+
+    def _choose_child(self) -> str:
+        print("\n" + "="*80)
+        print("SELECT CHILD TABLE TO JOIN")
+        print("="*80)
+        
+        # Get already joined tables
+        joined_tables = {step["child"] for step in self.join_plan}
+        
+        # Show only unjoin tables
+        available = {a: s for a, s in self.catalog.items() 
+                    if a != self.base_alias and a not in joined_tables}
+        
+        if not available:
+            raise ValueError("No more tables available to join!")
+        
+        print("\n📦 Available CHILD tables:")
+        for a, s in available.items():
+            print(f"  • {a}: {s.schema}.{s.table}")
+        
+        while True:
+            child = input("\n🎯 Choose CHILD table alias (e.g., T2): ").strip()
+            
+            if not child:
+                print("  ⚠️  Please enter a table alias")
+                continue
+            
+            if child == self.base_alias:
+                print(f"  ⚠️  Cannot join base table {self.base_alias} to itself")
+                continue
+            
+            if child in joined_tables:
+                print(f"  ⚠️  Table {child} is already joined. Choose a different table.")
+                continue
+            
+            if child not in self.catalog:
+                print(f"  ⚠️  Invalid alias '{child}'. Choose from available tables above.")
+                continue
+            
+            return child
+
+    def _choose_join_type(self) -> str:
+        print("\n" + "="*80)
+        print("STEP: SELECT JOIN TYPE")
+        print("="*80)
+        print("  1) INNER JOIN - Keep only matching rows from both tables")
+        print("  2) LEFT JOIN  - Keep all BASE rows + matching CHILD rows")
+        print("  3) RIGHT JOIN - Keep all CHILD rows + matching BASE rows")
+        m = {"1": "INNER JOIN", "2": "LEFT JOIN", "3": "RIGHT JOIN"}
+        
+        while True:
+            ch = input("\n→ Choose (1/2/3): ").strip()
+            if ch in m:
+                Logger.success(f"Join type: {m[ch]}")
+                return m[ch]
+            print("  ⚠️  Invalid choice. Please enter 1, 2, or 3")
+
+    def _choose_cardinality(self) -> str:
+        print("\n" + "="*80)
+        print("STEP: SELECT CARDINALITY (ROW RELATIONSHIP)")
+        print("="*80)
+        print("  1) 1:1      - One BASE row matches one CHILD row (keeps BASE count)")
+        print("  2) 1:Many   - One BASE row matches MANY CHILD rows (collapse needed)")
+        print("  3) Many:1   - Many BASE rows match one CHILD row (keeps BASE count)")
+        m = {"1": "1:1", "2": "1:Many", "3": "Many:1"}
+        
+        while True:
+            ch = input("\n→ Choose (1/2/3): ").strip()
+            if ch in m:
+                Logger.success(f"Cardinality: {m[ch]}")
+                return m[ch]
+            print("  ⚠️  Invalid choice. Please enter 1, 2, or 3")
+
+    def _map_keys(self, left_alias: str, right_alias: str) -> List[Tuple[str, str]]:
+        print("\n" + "="*80)
+        print("STEP: MAP JOIN KEYS")
+        print("="*80)
+        
+        lsrc = self.catalog[left_alias]
+        rsrc = self.catalog[right_alias]
+        lcols = lsrc.columns
+        rcols = rsrc.columns
+
+        print(f"\n🔑 {left_alias} columns:")
+        for i, c in enumerate(lcols, 1):
+            dt = f" ({c.data_type})" if c.data_type else ""
+            print(f"  {i:2}. {c.name}{dt}")
+        ls = input(f"\n→ Pick {left_alias} key column numbers (comma-separated): ").strip()
+        lidx = [int(x.strip()) for x in ls.split(",") if x.strip().isdigit()]
+        lkeys = [lcols[i-1].name for i in lidx if 1 <= i <= len(lcols)]
+
+        print(f"\n🔑 {right_alias} columns:")
+        for i, c in enumerate(rcols, 1):
+            dt = f" ({c.data_type})" if c.data_type else ""
+            print(f"  {i:2}. {c.name}{dt}")
+        rs = input(f"\n→ Pick {right_alias} key column numbers (comma-separated): ").strip()
+        ridx = [int(x.strip()) for x in rs.split(",") if x.strip().isdigit()]
+        rkeys = [rcols[i-1].name for i in ridx if 1 <= i <= len(rcols)]
+
+        if len(lkeys) != len(rkeys) or len(lkeys) == 0:
+            raise ValueError("Number of left and right keys must match and be > 0")
+
+        self.base_table_keyset.update(lkeys)
+        pairs = [(f"{left_alias}.{L}", f"{right_alias}.{R}") for L, R in zip(lkeys, rkeys)]
+        Logger.success(f"Key mapping: {' AND '.join([f'{L} = {R}' for L, R in pairs])}")
+        return pairs
+
+    # ---------- CHECKS ----------
+    def _count_total(self, alias: str) -> Optional[int]:
+        src = self.catalog[alias]
+        sql = f"SELECT COUNT(*) FROM {src.fqtn}"
+        return self.db.scalar(sql)
+
+    def _count_distinct(self, alias: str, cols: List[str]) -> Optional[int]:
+        src = self.catalog[alias]
+        keylist = ", ".join(SQLHelper.q_ident(c) for c in cols)
+        sql = f"SELECT COUNT(*) FROM (SELECT DISTINCT {keylist} FROM {src.fqtn}) D"
+        return self.db.scalar(sql)
+
+    def _uniqueness_check(self, alias: str, cols: List[str]) -> Optional[bool]:
+        total = self._count_total(alias)
+        distinct = self._count_distinct(alias, cols)
+        if total is None or distinct is None:
+            Logger.warning(f"Uniqueness check inconclusive for {alias}")
+            return None
+        is_unique = total == distinct
+        status = "✓ UNIQUE" if is_unique else "✗ NOT UNIQUE"
+        Logger.info(f"{alias} key uniqueness: {status} (Total: {total}, Distinct: {distinct})")
+        return is_unique
+
+    # ---------- COLLAPSE OPTIONS ----------
+    def _choose_collapse(self, child_alias: str) -> Dict[str, Any]:
+        print("\n" + "="*80)
+        print("STEP: HANDLE 1:MANY RELATIONSHIP")
+        print("="*80)
+        print("Child has multiple rows per BASE row. Choose how to handle:")
+        print("  1) LATEST      - Keep only the latest row by timestamp (preserves BASE count)")
+        print("  2) AGGREGATE   - Aggregate child values (SUM, MAX, etc.) (preserves BASE count)")
+        print("  3) NO-COLLAPSE - Keep ALL child rows (result will have CHILD count)")
+        
+        while True:
+            ch = input("\n→ Choose (1/2/3): ").strip()
+            
+            if ch == "1":
+                print("\n" + "="*80)
+                print("LATEST BY TIMESTAMP")
+                print("="*80)
+                ts_candidates = []
+                for c in self.catalog[child_alias].columns:
+                    nm = c.name.lower()
+                    if any(k in nm for k in ["update", "updated", "modify", "modified", "create", "created", "date", "time", "timestamp", "dt"]):
+                        ts_candidates.append(c.name)
+                
+                print("\n⏱️ Pick timestamp column for LATEST:")
+                if ts_candidates:
+                    for i, n in enumerate(ts_candidates, 1):
+                        print(f"  {i}. {n}")
+                    ix = input("\n→ Choose number or type column name: ").strip()
+                    if ix.isdigit() and 1 <= int(ix) <= len(ts_candidates):
+                        ts_col = ts_candidates[int(ix)-1]
+                    else:
+                        ts_col = ix if ix else ts_candidates[0]
+                else:
+                    ts_col = input("→ Enter timestamp column name: ").strip()
+                
+                if not ts_col:
+                    print("  ⚠️  Timestamp column required for LATEST")
+                    continue
+                
+                Logger.success(f"LATEST mode: Using {ts_col} (DESC)")
+                return {"mode": "LATEST", "ts_col": ts_col, "order": "DESC"}
+
+            elif ch == "2":
+                print("\n" + "="*80)
+                print("AGGREGATE CONFIGURATION")
+                print("="*80)
+                print("Auto-suggestions:")
+                print("  • Numeric → SUM")
+                print("  • DateTime/Other → MAX")
+                print("  • Text → STRING_AGG")
+                
+                child = self.catalog[child_alias]
+                agg_map: Dict[str, str] = {}
+                
+                for c in child.columns:
+                    t = (c.data_type or "").lower()
+                    if any(k in t for k in ["int", "decimal", "numeric", "float", "real", "money"]):
+                        default = "SUM"
+                    elif t in ("date", "datetime", "datetime2", "smalldatetime", "datetimeoffset", "time", "bit"):
+                        default = "MAX"
+                    elif any(k in t for k in ["char", "nchar", "varchar", "nvarchar", "text"]):
+                        default = "STRING_AGG"
+                    else:
+                        default = "MAX"
+                    agg_map[c.name] = default
+                
+                print("\nDefault aggregations assigned.")
+                print("To override, enter: ColumnName|FUNCTION (one per line)")
+                print("Available functions: SUM, MAX, MIN, AVG, STRING_AGG, COUNT_DISTINCT")
+                print("Press Enter on empty line to finish.")
+                
+                while True:
+                    line = input("> ").strip()
+                    if not line:
+                        break
+                    if "|" not in line:
+                        print("  Format: ColumnName|FUNCTION")
+                        continue
+                    col, func = [x.strip() for x in line.split("|", 1)]
+                    agg_map[col] = func.upper()
+                
+                Logger.success("Aggregation configured")
+                return {"mode": "AGG", "agg_map": agg_map}
+
+            elif ch == "3":
+                Logger.success("NO-COLLAPSE: All CHILD rows will be kept (rowcount matches CHILD)")
+                return {"mode": "NOCOLLAPSE"}
+
+            else:
+                print("  ⚠️  Invalid choice. Please enter 1, 2, or 3")
+
+    # ---------- SQL GENERATION ----------
+    def _cte_clean(self, alias: str, force_include_cols: List[str] = None) -> str:
+        src = self.catalog[alias]
+        force_include = set(force_include_cols or [])
+        proj_cols = set(c.name for c in src.selected_columns())
+        to_project = list(proj_cols.union(force_include)) if proj_cols else list(set(src.column_names()).union(force_include))
+        ordered = [c.name for c in src.columns if c.name in to_project]
+        
+        if not ordered:
+            select_list = "    *"
+        else:
+            # KEEP ORIGINAL NAMES - Add alias to column name for clarity
+            select_list = ",\n".join([f"    {alias}.{SQLHelper.q_ident(c)} AS {SQLHelper.q_ident(c)}" for c in ordered])
+        
+        return f"""{alias}_clean AS (
+  SELECT
+{select_list}
+  FROM {src.fqtn} {alias}
+)"""
+
+    def _cte_latest(self, alias: str, ts_col: str, key_pairs: List[Tuple[str, str]]) -> str:
+        right_keys = [r.split(".", 1)[1] for _, r in key_pairs]
+        part_keys = ", ".join(f"{alias}_clean.{SQLHelper.q_ident(k)}" for k in right_keys)
+        order_ref = f"{alias}_clean.{SQLHelper.q_ident(ts_col)}"
+        return f"""{alias}_norm_latest AS (
+  SELECT * FROM (
+    SELECT
+      {alias}_clean.*,
+      ROW_NUMBER() OVER (PARTITION BY {part_keys} ORDER BY {order_ref} DESC) AS rn
+    FROM {alias}_clean
+  ) Z
+  WHERE rn = 1
+)"""
+
+    def _cte_agg(self, alias: str, key_pairs: List[Tuple[str, str]], agg_map: Dict[str, str]) -> str:
+        right_keys = [r.split(".", 1)[1] for _, r in key_pairs]
+        keys_str = ", ".join(f"{alias}_clean.{SQLHelper.q_ident(k)}" for k in right_keys)
+        proj = []
+        
+        for col, func in agg_map.items():
+            if col in right_keys:
+                continue
+            funcU = func.upper()
+            colref = f"{alias}_clean.{SQLHelper.q_ident(col)}"
+            # KEEP ORIGINAL COLUMN NAME with function suffix
+            outname = f"{col}_{funcU.lower()}"
+            
+            if funcU == "STRING_AGG":
+                proj.append(f"    STRING_AGG(CAST({colref} AS NVARCHAR(MAX)), ',') AS {SQLHelper.q_ident(outname)}")
+            elif funcU == "COUNT_DISTINCT":
+                proj.append(f"    COUNT(DISTINCT {colref}) AS {SQLHelper.q_ident(outname)}")
+            else:
+                proj.append(f"    {funcU}({colref}) AS {SQLHelper.q_ident(outname)}")
+        
+        if not proj:
+            proj.append("    COUNT(*) AS [row_count]")
+        
+        agg_select = ",\n".join(proj)
+        return f"""{alias}_norm_agg AS (
+  SELECT
+    {keys_str},
+{agg_select}
+  FROM {alias}_clean
+  GROUP BY {keys_str}
+)"""
+
+    def _join_clause(self, left_alias: str, right_ref: str, right_alias: str, key_pairs: List[Tuple[str, str]], join_type: str) -> str:
+        ons = []
+        for L, R in key_pairs:
+            L_raw = L.split(".", 1)[1]
+            R_raw = R.split(".", 1)[1]
+            left_expr = f"{left_alias}_clean.{SQLHelper.q_ident(L_raw)}"
+            right_expr = f"{right_ref}.{SQLHelper.q_ident(R_raw)}"
+            ons.append(f"{left_expr} = {right_expr}")
+        return f"  {join_type} {right_ref} ON " + " AND ".join(ons)
+
+    def build_and_apply_view(self):
+        ctes: List[str] = []
+
+        ctes.append(self._cte_clean(self.base_alias, force_include_cols=list(self.base_table_keyset)))
+
+        join_clauses: List[str] = []
+        for step in self.join_plan:
+            child = step["child"]
+            join_type = step["join_type"]
+            key_pairs = step["keys"]
+            mode = step["mode"]
+
+            child_keys = [r.split('.',1)[1] for _, r in key_pairs]
+            ctes.append(self._cte_clean(child, force_include_cols=child_keys))
+            right_ref = f"{child}_clean"
+
+            if mode == "1:Many":
+                cmode = step["collapse"].get("mode", "")
+                if cmode == "LATEST":
+                    ctes.append(self._cte_latest(child, step["collapse"]["ts_col"], key_pairs))
+                    right_ref = f"{child}_norm_latest"
+                elif cmode == "AGG":
+                    ctes.append(self._cte_agg(child, key_pairs, step["collapse"]["agg_map"]))
+                    right_ref = f"{child}_norm_agg"
+                elif cmode == "NOCOLLAPSE":
+                    if join_type != "RIGHT JOIN":
+                        Logger.info("For NO-COLLAPSE using RIGHT JOIN to match CHILD rowcount")
+                        join_type = "RIGHT JOIN"
+                        step["join_type"] = "RIGHT JOIN"  # Update for later reference
+
+            join_clauses.append(self._join_clause(self.base_alias, right_ref, child, key_pairs, join_type))
+
+        # Build merged CTE with explicit column selection to avoid duplicates
+        join_clauses_list = []
+        merged_select_parts = []
+        
+        # Add base table columns
+        for col in self.catalog[self.base_alias].columns:
+            if col.selected or col.name in self.base_table_keyset:
+                merged_select_parts.append(f"{self.base_alias}_clean.{SQLHelper.q_ident(col.name)}")
+        
+        # Add child table columns (excluding duplicate keys)
+        for step in self.join_plan:
+            child = step["child"]
+            join_type = step["join_type"]
+            key_pairs = step["keys"]
+            mode = step["mode"]
+            
+            # Determine the CTE reference for this child
+            right_ref = f"{child}_clean"
+            if mode == "1:Many":
+                cmode = step["collapse"].get("mode", "")
+                if cmode == "LATEST":
+                    right_ref = f"{child}_norm_latest"
+                elif cmode == "AGG":
+                    right_ref = f"{child}_norm_agg"
+            
+            # Build join clause
+            ons = []
+            right_keys_set = set()
+            for L, R in key_pairs:
+                L_raw = L.split(".", 1)[1]
+                R_raw = R.split(".", 1)[1]
+                right_keys_set.add(R_raw)
+                left_expr = f"{self.base_alias}_clean.{SQLHelper.q_ident(L_raw)}"
+                right_expr = f"{right_ref}.{SQLHelper.q_ident(R_raw)}"
+                ons.append(f"{left_expr} = {right_expr}")
+            
+            join_clause = f"  {join_type} {right_ref} ON " + " AND ".join(ons)
+            join_clauses_list.append(join_clause)
+            
+            # Add child columns (excluding join keys to avoid duplicates)
+            child_cols = self.catalog[child].columns
+            for col in child_cols:
+                if col.selected or col.name in right_keys_set:
+                    # Skip if it's a join key and already in base
+                    if col.name in right_keys_set and col.name in [c.name for c in self.catalog[self.base_alias].columns]:
+                        continue
+                    
+                    # For aggregated columns, use the aggregated name
+                    if mode == "1:Many" and step["collapse"].get("mode") == "AGG":
+                        if col.name not in right_keys_set:
+                            agg_func = step["collapse"]["agg_map"].get(col.name, "MAX").lower()
+                            agg_col_name = f"{col.name}_{agg_func}"
+                            merged_select_parts.append(f"{right_ref}.{SQLHelper.q_ident(agg_col_name)}")
+                        else:
+                            merged_select_parts.append(f"{right_ref}.{SQLHelper.q_ident(col.name)}")
+                    else:
+                        merged_select_parts.append(f"{right_ref}.{SQLHelper.q_ident(col.name)}")
+        
+        merges = "\n" + "\n".join(join_clauses_list) if join_clauses_list else ""
+        merged_select = ",\n    ".join(merged_select_parts)
+        
+        merged_sql = f"""merged AS (
+  SELECT
+    {merged_select}
+  FROM {self.base_alias}_clean{merges}
+)"""
+        ctes.append(merged_sql)
+
+        all_ctes = ",\n\n".join(ctes)
+        
+        # Final SELECT uses column names from merged CTE (already deduplicated)
+        select_list = "*"
+        
+        sql = f"""CREATE OR ALTER VIEW {self.view_name}
+AS
+WITH
+{all_ctes}
+
+SELECT {select_list}
+FROM merged;
+"""
+        
+        Logger.debug("\n" + "="*80)
+        Logger.debug("GENERATED SQL:")
+        Logger.debug("="*80)
+        Logger.debug(sql)
+        
+        try:
+            self.db.cursor.execute(sql)
+            self.db.conn.commit()
+            Logger.success(f"View '{self.view_name}' created/updated successfully ✓")
+        except Exception as e:
+            Logger.error(f"Failed to apply view: {e}")
+            raise
+
+    # ---------- MAIN LOOP ----------
+    def run(self):
+        if not self.base_alias:
+            self._prompt_base()
+
+        while True:
+            print("\n" + "="*80)
+            print(f"VIEW BUILDER STATUS")
+            print("="*80)
+            print(f"Current BASE: {self.base_alias}")
+            print(f"Target VIEW: {self.view_name}")
+            print(f"Joins completed: {len(self.join_plan)}")
+            
+            # Show joined tables
+            if self.join_plan:
+                print(f"\nJoined tables:")
+                for i, step in enumerate(self.join_plan, 1):
+                    join_desc = f"{self.base_alias} {step['join_type']} {step['child']}"
+                    card_desc = f"({step['mode']})"
+                    if step['mode'] == '1:Many':
+                        collapse_mode = step['collapse'].get('mode', '')
+                        if collapse_mode == 'LATEST':
+                            card_desc = f"(1:Many - LATEST by {step['collapse'].get('ts_col')})"
+                        elif collapse_mode == 'AGG':
+                            card_desc = f"(1:Many - AGGREGATED)"
+                        elif collapse_mode == 'NOCOLLAPSE':
+                            card_desc = f"(1:Many - NO-COLLAPSE)"
+                    print(f"  {i}. {join_desc} {card_desc}")
+            print("="*80)
+
+            # Check if there are more tables to join
+            joined_tables = {step["child"] for step in self.join_plan}
+            available = [a for a in self.catalog.keys() 
+                        if a != self.base_alias and a not in joined_tables]
+            
+            if not available:
+                print("\n🎉 All available tables have been joined!")
+                print(f"✅ Final view '{self.view_name}' is complete.")
+                break
+
+            try:
+                child = self._choose_child()
+            except ValueError as e:
+                Logger.error(str(e))
+                break
+            
+            print(f"\n🔗 Joining: {self.base_alias} —— {child}")
+
+            join_type = self._choose_join_type()
+            card = self._choose_cardinality()
+            key_pairs = self._map_keys(self.base_alias, child)
+            self._pick_columns(child)
+
+            # Uniqueness checks
+            left_keys = [L.split(".", 1)[1] for (L, _) in key_pairs]
+            right_keys = [R.split(".", 1)[1] for (_, R) in key_pairs]
+            left_unique = self._uniqueness_check(self.base_alias, left_keys)
+            right_unique = self._uniqueness_check(child, right_keys)
+            
+            if card in ("1:1", "Many:1") and right_unique is False:
+                Logger.warning(f"⚠️  Child {child} is NOT unique on join keys!")
+                Logger.warning("This may cause row multiplication. Consider 1:Many with collapse.")
+            
+            if card == "1:1" and left_unique is False:
+                Logger.warning(f"⚠️  Base {self.base_alias} is NOT unique on join keys!")
+                Logger.warning("1:1 cardinality may be incorrect.")
+
+            collapse_cfg = None
+            if card == "1:Many":
+                collapse_cfg = self._choose_collapse(child)
+
+            self.join_plan.append({
+                "child": child,
+                "join_type": join_type,
+                "mode": card,
+                "keys": key_pairs,
+                "collapse": collapse_cfg or {}
+            })
+
+            Logger.info("\n🔨 Building view...")
+            self.build_and_apply_view()
+            Logger.success(f"✅ View '{self.view_name}' UPDATED successfully!")
+
+            # Check again if there are more tables
+            joined_tables = {step["child"] for step in self.join_plan}
+            remaining = [a for a in self.catalog.keys() 
+                        if a != self.base_alias and a not in joined_tables]
+            
+            if not remaining:
+                print("\n🎉 All available tables have been joined!")
+                print(f"✅ Final view '{self.view_name}' is complete.")
+                break
+
+            cont = input("\n❓ Join another table? (y/n): ").strip().lower()
+            if cont != "y":
+                break
+
+# =========================
+# MAIN
+# =========================
+def main():
+    print("\n" + "="*80)
+    print("🎉 JOIN-ONLY VIEW MAKER")
+    print("   (Grain-Preserving with Original Column Names)")
+    print("="*80)
+    print("\nFlow: Select Base → Join Child → Update View → Repeat\n")
+
+    servers = [
+        {
+            "label": "Local Development Server",
+            "server": r"localhost\SQLEXPRESS",
+            "database": "BigDataDB",
+            "auth_type": "windows",
+            "user": None,
+            "tables": [
+                {"schema": "dbo", "table": "BusRegistry", "alias": "T1"},
+                {"schema": "dbo", "table": "FuelConsumption", "alias": "T2"},
+                {"schema": "dbo", "table": "MaintenanceRecords", "alias": "T3"},
+                {"schema": "dbo", "table": "DriverAssignments", "alias": "T4"},
+                {"schema": "dbo", "table": "RoutePerformance", "alias": "T5"},
+            ]
+        }
+    ]
+
+    print("\n📡 AVAILABLE SERVERS")
+    for i, s in enumerate(servers, 1):
+        print(f"\n{i}. {s['label']}")
+        print(f"   Server: {s['server']}")
+        print(f"   Database: {s['database']}")
+        print(f"   Auth: {s['auth_type'].upper()}")
+
+    sel = input("\n→ Select server number (or 'q' to quit): ").strip().lower()
+    if sel == "q":
+        Logger.info("Goodbye!")
+        return
+    
+    idx = int(sel) - 1
+    cfg = servers[idx]
+
+    db = DatabaseConnection(
+        label=cfg["label"],
+        server=cfg["server"],
+        database=cfg["database"],
+        auth_type=cfg["auth_type"],
+        user=cfg.get("user")
+    )
+
+    try:
+        db.connect()
+        app = JoinOnlyViewBuilder(db, cfg["tables"], view_name="dbo.V")
+        app.run()
+        
+        print("\n" + "="*80)
+        print("✅ SESSION COMPLETE")
+        print("="*80)
+        print(f"\n📊 Final View: {app.view_name}")
+        print(f"📈 Total Joins: {len(app.join_plan)}")
+        print("\nYou can now query your view:")
+        print(f"   SELECT * FROM {app.view_name}")
+        print("="*80)
+        
+    except KeyboardInterrupt:
+        Logger.warning("\n\n⚠️  Session cancelled by user (Ctrl+C)")
+    except Exception as e:
+        Logger.error(f"Fatal error: {e}")
+        import traceback
+        Logger.debug(traceback.format_exc())
+        sys.exit(1)
+    finally:
+        db.close()
+
+if __name__ == "__main__":
+    main()
