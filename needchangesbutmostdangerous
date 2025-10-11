@@ -1,0 +1,1158 @@
+#this code needs lot of changes but is the most dangerous one yet 
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+ULTIMATE SQL VIEW PIPELINE BUILDER - AUTO CARDINALITY & GRAIN-PRESERVING JOINS
+===============================================================================
+This version auto-infers join strategies based on the selected grain, so users
+don't need to understand cardinalities. All editable behavior is centralized in
+SECTION A: POLICIES & HEURISTICS (EDIT HERE). Everything else is stable.
+"""
+
+import pyodbc
+import sys
+import time
+import re
+from typing import List, Dict, Tuple, Optional, Any
+from dataclasses import dataclass, field
+from enum import Enum
+
+# =============================================================================
+# SECTION 0: LOW-LEVEL UTILS (STABLE / DO NOT TOUCH)
+# =============================================================================
+
+class Logger:
+    @staticmethod
+    def info(msg: str):    print(f"[INFO {time.strftime('%H:%M:%S')}] {msg}", flush=True)
+    @staticmethod
+    def success(msg: str): print(f"[✅ SUCCESS {time.strftime('%H:%M:%S')}] {msg}", flush=True)
+    @staticmethod
+    def warning(msg: str): print(f"[⚠️  WARNING {time.strftime('%H:%M:%S')}] {msg}", flush=True)
+    @staticmethod
+    def error(msg: str):   print(f"[❌ ERROR {time.strftime('%H:%M:%S')}] {msg}", flush=True)
+    @staticmethod
+    def debug(msg: str):   print(f"[🔍 DEBUG {time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+class SQLHelper:
+    @staticmethod
+    def quote_identifier(identifier: str) -> str:
+        if identifier is None:
+            return identifier
+        if "." in identifier and not identifier.strip().startswith("["):
+            parts = [p.strip("[] ") for p in identifier.split(".")]
+            return ".".join(f"[{p}]" for p in parts)
+        return f"[{identifier.strip('[]')}]"
+
+    @staticmethod
+    def quote_literal(value: Any) -> str:
+        if value is None: return "NULL"
+        val = str(value)
+        if re.fullmatch(r"-?\d+(?:\.\d+)?", val):  # numeric literal
+            return val
+        val = val.replace("'", "''")
+        return f"'{val}'"
+
+    @staticmethod
+    def is_valid_identifier(name: str) -> bool:
+        return bool(re.match(r'^[A-Za-z_][A-Za-z0-9_]*$', name))
+
+    @staticmethod
+    def join_cols_alias_prefix(alias: str, cols: List[str]) -> List[str]:
+        # Turns ["ColA","ColB"] into ["T1__ColA","T1__ColB"]
+        return [f"{alias}__{c}" for c in cols]
+
+    @staticmethod
+    def tuple_list_to_select_aliases(alias: str, cols: List[str]) -> List[str]:
+        # returns select projections: alias.[col] AS [Alias__col]
+        out = []
+        for c in cols:
+            out.append(f"    {alias}.{SQLHelper.quote_identifier(c)} AS {SQLHelper.quote_identifier(alias+'__'+c)}")
+        return out
+
+    @staticmethod
+    def comma_join(items: List[str], sep=", "):
+        return sep.join(items)
+
+# =============================================================================
+# SECTION A: POLICIES & HEURISTICS (EDIT HERE)
+# Everything in this section is meant for future tweaks.
+# =============================================================================
+
+class JoinStrategy(Enum):
+    ONE_TO_ONE = "one_to_one"
+    ONE_TO_MANY = "one_to_many"
+    MANY_TO_ONE = "many_to_one"
+    MANY_TO_MANY = "many_to_many"
+    AGGREGATE = "aggregate"
+    LATEST = "latest"
+
+@dataclass
+class InferencePolicy:
+    SAMPLE_MAX_ROWS: int = 100000     # cap for profiling queries
+    SAMPLE_TOP_DISTINCT: int = 20000  # cap for distinct key scans
+    DATETIME_TYPE_NAMES: Tuple[str, ...] = (
+        "date", "datetime", "datetime2", "smalldatetime", "datetimeoffset", "time"
+    )
+    DEFAULT_AGG_NUMERIC: str = "SUM"
+    DEFAULT_AGG_TEXT: str = "STRING_AGG"  # with comma separator
+    DEFAULT_AGG_BOOL: str = "MAX"         # bit
+    DEFAULT_AGG_OTHER: str = "MAX"
+    STRING_AGG_SEPARATOR: str = ","       # string_agg delim
+    # If preserving grain and child is 1:M or M:M:
+    PREFER_LATEST_IF_TIMESTAMP: bool = True
+    FALLBACK_TO_AGGREGATE: bool = True
+
+class Heuristics:
+    @staticmethod
+    def pick_latest_timestamp_column(col_types: Dict[str, str], policy: InferencePolicy) -> Optional[str]:
+        # col_types: {"ColName": "datatype"}
+        dt = [c for c, t in col_types.items() if t.lower() in policy.DATETIME_TYPE_NAMES]
+        if not dt: return None
+        # Prefer columns with common time-ish names
+        preferred = sorted(
+            dt,
+            key=lambda name: (
+                0 if any(k in name.lower() for k in ["updated", "modified", "last", "changed"]) else
+                1 if any(k in name.lower() for k in ["created", "inserted", "createdat", "created_on"]) else
+                2
+            )
+        )
+        return preferred[0]
+
+    @staticmethod
+    def suggest_aggregations_for_child(col_types: Dict[str, str], policy: InferencePolicy) -> Dict[str, str]:
+        """
+        Produce a mapping {col_name: AGG_FUNC} for child table when collapsing.
+        - Numeric -> SUM
+        - Bit/bool -> MAX
+        - Text -> STRING_AGG
+        - Others -> MAX
+        We *skip* the join key columns; caller should remove keys before aggregating.
+        """
+        aggs = {}
+        for col, typ in col_types.items():
+            t = typ.lower()
+            if any(k in t for k in ["int", "decimal", "numeric", "float", "real", "money"]):
+                aggs[col] = policy.DEFAULT_AGG_NUMERIC
+            elif t in ("bit",):
+                aggs[col] = policy.DEFAULT_AGG_BOOL
+            elif any(k in t for k in ["char", "text", "nchar", "nvarchar", "varchar"]):
+                aggs[col] = policy.DEFAULT_AGG_TEXT
+            elif t in policy.DATETIME_TYPE_NAMES:
+                # often we don't aggregate timestamps unless STRING_AGG is desired; use MAX
+                aggs[col] = "MAX"
+            else:
+                aggs[col] = policy.DEFAULT_AGG_OTHER
+        return aggs
+
+# =============================================================================
+# SECTION B: DATA MODELS (STABLE)
+# =============================================================================
+
+@dataclass
+class ColumnInfo:
+    name: str
+    data_type: str
+    is_selected: bool = True
+    transform: Optional[str] = None
+    new_alias: Optional[str] = None
+
+    def get_expression(self, table_alias: str) -> str:
+        base_ref = f"{table_alias}.{SQLHelper.quote_identifier(self.name)}"
+        return self.transform if self.transform else base_ref
+
+    def get_output_alias(self, table_alias: str) -> str:
+        # SAFE UNIQUE default alias -> Alias__ColName
+        return self.new_alias if self.new_alias else f"{table_alias}__{self.name}"
+
+@dataclass
+class SourceTable:
+    schema: str
+    table: str
+    alias: str
+    columns: List[ColumnInfo] = field(default_factory=list)
+
+    @property
+    def fully_qualified_name(self) -> str:
+        if "." in self.schema:
+            return f"{self.schema}.{SQLHelper.quote_identifier(self.table)}"
+        return f"{SQLHelper.quote_identifier(self.schema)}.{SQLHelper.quote_identifier(self.table)}"
+
+    def get_selected_columns(self) -> List[ColumnInfo]:
+        return [c for c in self.columns if c.is_selected]
+
+    def display_columns(self):
+        print(f"\n📊 Columns in {self.schema}.{self.table} (alias: {self.alias}):")
+        print("=" * 80)
+        for i, col in enumerate(self.columns, 1):
+            status = "✓" if col.is_selected else "✗"
+            transform = f" → {col.transform[:50]}..." if col.transform and len(col.transform) > 50 else (f" → {col.transform}" if col.transform else "")
+            rename = f" AS [{col.new_alias}]" if col.new_alias else ""
+            print(f"  {i:3}. [{status}] {col.name:30} ({col.data_type:15}){transform}{rename}")
+
+@dataclass
+class ChildJoin:
+    right_alias: str
+    join_type: str  # INNER/LEFT/RIGHT/FULL
+    key_pairs: List[Tuple[str, str]]
+    strategy: JoinStrategy
+    agg_map: Dict[str, str] = field(default_factory=dict)      # col -> func (for AGGREGATE)
+    order_by_col: Optional[str] = None                         # for LATEST
+    order_direction: str = "DESC"
+
+# =============================================================================
+# SECTION C: DB CONNECTION + METADATA & PROFILING (STABLE)
+# =============================================================================
+
+class DatabaseConnection:
+    def __init__(self, label: str, server: str, database: str, auth_type: str = "windows", user: Optional[str] = None):
+        self.label = label; self.server = server; self.database = database
+        self.auth_type = auth_type.lower(); self.user = user
+        self.conn = None; self.cursor = None
+
+    def connect(self):
+        Logger.info(f"Connecting to [{self.label}]")
+        Logger.debug(f"Server: {self.server} | Database: {self.database} | Auth: {self.auth_type.upper()}")
+        try:
+            if self.auth_type == "windows":
+                conn_str = f"DRIVER={{ODBC Driver 17 for SQL Server}};SERVER={self.server};DATABASE={self.database};Trusted_Connection=yes;"
+                self.conn = pyodbc.connect(conn_str)
+                Logger.success("Connected via Windows Authentication")
+            elif self.auth_type == "sql":
+                if not self.user:
+                    raise ValueError("Username required for SQL Authentication")
+                import getpass
+                pwd = getpass.getpass(f"Password for {self.user}@{self.server}: ")
+                conn_str = f"DRIVER={{ODBC Driver 17 for SQL Server}};SERVER={self.server};DATABASE={self.database};UID={self.user};PWD={pwd};"
+                self.conn = pyodbc.connect(conn_str)
+                Logger.success("Connected via SQL Authentication")
+            self.cursor = self.conn.cursor()
+        except Exception as e:
+            Logger.error(f"Connection failed: {e}")
+            raise
+
+    def close(self):
+        try:
+            if self.cursor: self.cursor.close()
+            if self.conn:   self.conn.close()
+            Logger.success(f"[{self.label}] Connection closed")
+        except Exception as e:
+            Logger.warning(f"Error closing connection: {e}")
+
+    def get_columns(self, schema: str, table: str) -> List[Tuple[str, str]]:
+        try:
+            if "." in schema:
+                q = f"SELECT TOP 0 * FROM {schema}.{SQLHelper.quote_identifier(table)}"
+                self.cursor.execute(q)
+                return [(col[0], "") for col in self.cursor.description]
+            q = """
+                SELECT COLUMN_NAME, DATA_TYPE
+                FROM INFORMATION_SCHEMA.COLUMNS
+                WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
+                ORDER BY ORDINAL_POSITION
+            """
+            self.cursor.execute(q, (schema, table))
+            return [(r[0], r[1]) for r in self.cursor.fetchall()]
+        except Exception as e:
+            Logger.error(f"Failed to fetch columns for {schema}.{table}: {e}")
+            return []
+
+    def run_scalar(self, sql: str) -> Optional[int]:
+        try:
+            self.cursor.execute(sql)
+            row = self.cursor.fetchone()
+            return row[0] if row else None
+        except Exception as e:
+            Logger.warning(f"Scalar query failed: {e}\n{sql}")
+            return None
+
+    def run_rows(self, sql: str) -> List[Tuple]:
+        try:
+            self.cursor.execute(sql)
+            return self.cursor.fetchall()
+        except Exception as e:
+            Logger.warning(f"Query failed: {e}\n{sql}")
+            return []
+
+# =============================================================================
+# SECTION D: JOIN INFERENCE ENGINE (EDITABLE ONLY VIA POLICY FUNCS)
+# =============================================================================
+
+class JoinInferenceEngine:
+    """
+    Decides the join strategy to preserve the declared grain.
+    """
+    def __init__(self, db: DatabaseConnection, sources: Dict[str, 'SourceTable'], policy: InferencePolicy):
+        self.db = db
+        self.sources = sources
+        self.policy = policy
+
+    def _col_types_map(self, alias: str) -> Dict[str, str]:
+        st = self.sources[alias]
+        return {c.name: (c.data_type or "") for c in st.columns}
+
+    def _fq(self, alias: str) -> str:
+        return self.sources[alias].fully_qualified_name
+
+    def _distinct_key_count(self, alias: str, cols: List[str]) -> Optional[int]:
+        fq = self._fq(alias)
+        cols_q = ", ".join(f"{SQLHelper.quote_identifier(c)}" for c in cols)
+        sql = f"SELECT COUNT(*) FROM (SELECT DISTINCT {cols_q} FROM {fq}) D"
+        return self.db.run_scalar(sql)
+
+    def _max_dupe_count(self, alias: str, cols: List[str]) -> Optional[int]:
+        fq = self._fq(alias)
+        cols_q = ", ".join(f"{SQLHelper.quote_identifier(c)}" for c in cols)
+        sql = (
+            f"SELECT TOP 1 COUNT(*) AS cnt "
+            f"FROM {fq} "
+            f"GROUP BY {cols_q} "
+            f"ORDER BY cnt DESC"
+        )
+        return self.db.run_rows(sql)[0][0] if self.db.run_rows(sql) else None
+
+    def _is_unique_key(self, alias: str, cols: List[str]) -> Optional[bool]:
+        total = self.db.run_scalar(f"SELECT COUNT(*) FROM {self._fq(alias)}")
+        distinct = self._distinct_key_count(alias, cols)
+        if total is None or distinct is None: return None
+        return total == distinct
+
+    def infer_cardinality(self, left_alias: str, right_alias: str, left_cols: List[str], right_cols: List[str]) -> Tuple[JoinStrategy, Dict[str, Any]]:
+        """
+        Returns (strategy, extras) *before* grain-preservation adjustment.
+        Extras may hold: {"right_has_dupes": bool, "left_unique": bool, "right_unique": bool}
+        """
+        left_unique = self._is_unique_key(left_alias, left_cols)
+        right_unique = self._is_unique_key(right_alias, right_cols)
+
+        # Fall back: inspect max dupes if uniqueness unknown
+        left_max_dupe = self._max_dupe_count(left_alias, left_cols)
+        right_max_dupe = self._max_dupe_count(right_alias, right_cols)
+
+        # Deduce uniqueness booleans
+        if left_unique is None:
+            left_unique = (left_max_dupe == 1) if left_max_dupe is not None else None
+        if right_unique is None:
+            right_unique = (right_max_dupe == 1) if right_max_dupe is not None else None
+
+        # Decide raw relationship
+        if left_unique and right_unique:
+            strat = JoinStrategy.ONE_TO_ONE
+        elif left_unique and (right_unique is False):
+            strat = JoinStrategy.ONE_TO_MANY
+        elif (left_unique is False) and right_unique:
+            strat = JoinStrategy.MANY_TO_ONE
+        else:
+            # Unknown or both not unique → treat as many-to-many
+            strat = JoinStrategy.MANY_TO_MANY
+
+        extras = {
+            "left_unique": left_unique,
+            "right_unique": right_unique,
+            "left_max_dupe": left_max_dupe,
+            "right_max_dupe": right_max_dupe
+        }
+        return strat, extras
+
+    def plan_to_preserve_grain(
+        self,
+        base_alias: str,
+        grain_cols_fullnames: List[str],  # ["T1.CustomerID", ...]
+        right_alias: str,
+        key_pairs: List[Tuple[str, str]]
+    ) -> ChildJoin:
+        """
+        Chooses strategy that preserves the declared grain on base_alias.
+        """
+        # Extract bare column names for profiling
+        left_cols = [l.split('.', 1)[1] for (l, r) in key_pairs]  # from "T1.CustomerID"
+        right_cols = [r.split('.', 1)[1] for (l, r) in key_pairs]
+
+        # Baseline inference
+        raw_strat, extras = self.infer_cardinality(base_alias, right_alias, left_cols, right_cols)
+        Logger.debug(f"Raw cardinality {base_alias} ↔ {right_alias}: {raw_strat.value} | extras={extras}")
+
+        # If MANY_TO_ONE or ONE_TO_ONE → safe lookup, grain preserved.
+        if raw_strat in (JoinStrategy.MANY_TO_ONE, JoinStrategy.ONE_TO_ONE):
+            return ChildJoin(
+                right_alias=right_alias,
+                join_type="LEFT",                  # grain-preserving
+                key_pairs=key_pairs,
+                strategy=raw_strat
+            )
+
+        # For ONE_TO_MANY or MANY_TO_MANY → must collapse to preserve base grain.
+        # Try LATEST if timestamp exists and policy allows
+        child_col_types = self._col_types_map(right_alias)
+        ts_col = Heuristics.pick_latest_timestamp_column(child_col_types, self.policy) if self.policy.PREFER_LATEST_IF_TIMESTAMP else None
+
+        if ts_col:
+            Logger.info(f"Selecting LATEST strategy on {right_alias} using timestamp '{ts_col}' to preserve grain")
+            return ChildJoin(
+                right_alias=right_alias,
+                join_type="LEFT",
+                key_pairs=key_pairs,
+                strategy=JoinStrategy.LATEST,
+                order_by_col=f"{right_alias}.{ts_col}",
+                order_direction="DESC"
+            )
+
+        # Else aggregate
+        if self.policy.FALLBACK_TO_AGGREGATE:
+            # suggest aggregates for all child cols except the key(s)
+            suggested = Heuristics.suggest_aggregations_for_child(child_col_types, self.policy)
+            for _, rc in key_pairs:
+                rcname = rc.split('.', 1)[1]
+                suggested.pop(rcname, None)
+
+            Logger.info(f"Selecting AGGREGATE strategy on {right_alias} to preserve grain")
+            return ChildJoin(
+                right_alias=right_alias,
+                join_type="LEFT",
+                key_pairs=key_pairs,
+                strategy=JoinStrategy.AGGREGATE,
+                agg_map={f"{right_alias}.{c}": func for c, func in suggested.items()}
+            )
+
+        # If none chosen (shouldn't happen with defaults), fall back to MANY_TO_ONE as lookup
+        Logger.warning("Fallback: using MANY_TO_ONE (lookup) though data suggests fanout")
+        return ChildJoin(
+            right_alias=right_alias,
+            join_type="LEFT",
+            key_pairs=key_pairs,
+            strategy=JoinStrategy.MANY_TO_ONE
+        )
+
+# =============================================================================
+# SECTION E: VIEW PIPELINE (STABLE)
+# =============================================================================
+
+class ViewPipeline:
+    def __init__(self, view_name: str, base_alias: str, grain_cols: List[str], policy: Optional[InferencePolicy] = None):
+        self.view_name = view_name if "." in view_name else f"dbo.{view_name}"
+        self.base_alias = base_alias
+        self.grain_cols = grain_cols
+        self.sources: Dict[str, SourceTable] = {}
+        self.child_joins: List[ChildJoin] = []
+        self.filters: List[str] = []
+        self.group_by_aggs: Dict[str, str] = {}
+        self.derived_columns: List[Tuple[str, str]] = []
+        self.output_columns: List[str] = []
+        self.policy = policy or InferencePolicy()
+
+    def add_source(self, source: SourceTable):
+        self.sources[source.alias] = source
+        Logger.debug(f"Added source: {source.alias} ({source.table})")
+
+    def add_join(self, join: ChildJoin):
+        self.child_joins.append(join)
+        Logger.debug(f"Added join to {join.right_alias} [{join.strategy.value}]")
+
+    def display_current_state(self):
+        print("\n" + "=" * 80)
+        print(f"📋 VIEW: {self.view_name}")
+        print(f"🎯 GRAIN: {', '.join(self.grain_cols)}")
+        print(f"📦 BASE TABLE: {self.base_alias}")
+        print("=" * 80)
+
+        print("\n📚 SOURCES:")
+        for alias, src in self.sources.items():
+            selected = len(src.get_selected_columns())
+            total = len(src.columns)
+            print(f"  • {alias}: {src.schema}.{src.table} ({selected}/{total} columns)")
+
+        if self.child_joins:
+            print("\n🔗 JOINS (auto-planned):")
+            for i, join in enumerate(self.child_joins, 1):
+                keys_str = ", ".join([f"{l}={r}" for l, r in join.key_pairs])
+                print(f"  {i}. {join.join_type} {join.right_alias} ON {keys_str} [{join.strategy.value}]")
+
+        if self.filters:
+            print("\n🔍 FILTERS:")
+            for i, f in enumerate(self.filters, 1):
+                print(f"  {i}. {f}")
+
+        if self.group_by_aggs:
+            print("\n📊 GROUP BY AGGREGATES:")
+            for col, func in self.group_by_aggs.items():
+                print(f"  • {func}({col})")
+
+        if self.derived_columns:
+            print("\n➕ DERIVED COLUMNS:")
+            for expr, alias in self.derived_columns:
+                print(f"  • {alias} = {expr}")
+
+        print("=" * 80)
+
+    # ---------- SQL Generation ----------
+
+    def generate_sql(self) -> str:
+        try:
+            Logger.debug("Starting SQL generation...")
+            ctes = []
+
+            # Step 1: Clean CTEs (safe aliasing ensures unique names)
+            for source in self.sources.values():
+                cte_name, cte_sql = self._generate_clean_cte(source)
+                ctes.append(cte_sql)
+
+            # Step 2: Strategy-specific normalization CTEs
+            join_clauses = []
+            for join in self.child_joins:
+                norm_cte, norm_sql = self._generate_join_strategy_cte(join)
+                if norm_sql and not norm_sql.startswith("--"):
+                    ctes.append(norm_sql)
+                join_clauses.append(self._generate_join_clause(join, norm_cte))
+
+            # Step 3: Merged CTE
+            merged_sql = self._generate_merged_cte(join_clauses)
+            ctes.append(merged_sql)
+
+            # Step 4: Optional GROUP BY at declared grain
+            final_source = "merged"
+            if self.group_by_aggs:
+                ctes.append(self._generate_group_by_cte())
+                final_source = "final"
+
+            # Step 5: Final SELECT (allow * due to unique aliasing)
+            final_select = self._generate_final_select(final_source)
+
+            ctes_sql = ",\n\n".join(ctes)
+            complete_sql = f"""CREATE OR ALTER VIEW {self.view_name}
+AS
+WITH
+{ctes_sql}
+
+{final_select}
+"""
+            Logger.success("SQL generation completed")
+            return complete_sql
+        except Exception as e:
+            Logger.error(f"Failed to generate SQL: {e}")
+            raise
+
+    def _generate_clean_cte(self, source: SourceTable) -> Tuple[str, str]:
+        cte_name = f"{source.alias}_clean"
+        selected = source.get_selected_columns()
+        if not selected:
+            # fallback: include at least key visual columns
+            selected = source.columns
+        projections = []
+        for col in selected:
+            expr = col.get_expression(source.alias)
+            alias = col.get_output_alias(source.alias)  # Alias__Col
+            projections.append(f"    {expr} AS {SQLHelper.quote_identifier(alias)}")
+        select_list = ",\n".join(projections) if projections else "    *"
+        sql = f"""{cte_name} AS (
+  SELECT
+{select_list}
+  FROM {source.fully_qualified_name} {source.alias}
+)"""
+        return cte_name, sql
+
+    def _generate_join_strategy_cte(self, join: ChildJoin) -> Tuple[str, str]:
+        input_cte = f"{join.right_alias}_clean"
+        if join.strategy in (JoinStrategy.ONE_TO_ONE, JoinStrategy.MANY_TO_ONE, JoinStrategy.ONE_TO_MANY):
+            # No structural change; ONE_TO_MANY will be handled by aggregation/later if chosen
+            return input_cte, f"-- {join.right_alias}: {join.strategy.value} (no normalization needed)"
+
+        cte_name = f"{join.right_alias}_norm"
+
+        if join.strategy == JoinStrategy.LATEST:
+            # We assumed order_by_col is like "T2.UpdatedAt" → must convert to input_cte prefix
+            order_ref = join.order_by_col.replace(f"{join.right_alias}.", f"{input_cte}.") if join.order_by_col else f"{input_cte}.UpdatedAt"
+            # Partition keys = right-side keys
+            partition_keys = [r.replace(f"{join.right_alias}.", f"{input_cte}.") for (_, r) in join.key_pairs]
+            partition_str = ", ".join(partition_keys)
+            sql = f"""{cte_name} AS (
+  SELECT * FROM (
+    SELECT
+      {input_cte}.*,
+      ROW_NUMBER() OVER (PARTITION BY {partition_str} ORDER BY {order_ref} {join.order_direction}) AS rn
+    FROM {input_cte}
+  ) ranked
+  WHERE rn = 1
+)"""
+            return cte_name, sql
+
+        if join.strategy == JoinStrategy.AGGREGATE or join.strategy == JoinStrategy.MANY_TO_MANY:
+            # Use provided agg_map. Group by right keys.
+            right_keys = [r.replace(f"{join.right_alias}.", f"{input_cte}.") for (_, r) in join.key_pairs]
+            keys_str = ", ".join(right_keys)
+            agg_projections = []
+            for fullcol, func in join.agg_map.items():
+                col_ref = fullcol.replace(f"{join.right_alias}.", f"{input_cte}.")
+                col_name = fullcol.split('.')[-1]
+                func_upper = func.upper()
+                if func_upper == "STRING_AGG":
+                    agg_projections.append(
+                        f"    STRING_AGG(CAST({col_ref} AS NVARCHAR(MAX)), '{InferencePolicy().STRING_AGG_SEPARATOR}') AS {SQLHelper.quote_identifier(col_name + '_agg')}"
+                    )
+                elif func_upper == "COUNT_DISTINCT":
+                    agg_projections.append(
+                        f"    COUNT(DISTINCT {col_ref}) AS {SQLHelper.quote_identifier(col_name + '_cnt_distinct')}"
+                    )
+                else:
+                    agg_projections.append(
+                        f"    {func_upper}({col_ref}) AS {SQLHelper.quote_identifier(col_name + '_' + func.lower())}"
+                    )
+            aggs_str = ",\n".join(agg_projections) if agg_projections else "    COUNT(*) AS [rows]"
+            sql = f"""{cte_name} AS (
+  SELECT
+    {keys_str},
+{aggs_str}
+  FROM {input_cte}
+  GROUP BY {keys_str}
+)"""
+            return cte_name, sql
+
+        # Fallback
+        return input_cte, f"-- {join.right_alias}: strategy {join.strategy.value} uses raw cleaned rows"
+
+    def _generate_join_clause(self, join: ChildJoin, right_cte: str) -> str:
+        on_conditions = []
+        for left_col, right_col in join.key_pairs:
+            left_ref = left_col.replace(f"{self.base_alias}.", f"{self.base_alias}_clean.")
+            right_ref = right_col.replace(f"{join.right_alias}.", f"{right_cte}.")
+            on_conditions.append(f"{left_ref} = {right_ref}")
+        on_clause = " AND ".join(on_conditions)
+        return f"  {join.join_type} JOIN {right_cte} ON {on_clause}"
+
+    def _generate_merged_cte(self, join_clauses: List[str]) -> str:
+        from_clause = f"  FROM {self.base_alias}_clean"
+        joins_str = "\n".join(join_clauses) if join_clauses else ""
+        where_clause = ""
+        if self.filters:
+            where_clause = "  WHERE " + "\n    AND ".join(self.filters)
+        sql = f"""merged AS (
+  SELECT *
+{from_clause}
+{joins_str}
+{where_clause}
+)"""
+        return sql
+
+    def _generate_group_by_cte(self) -> str:
+        # grain columns are like "T1.CustomerID" → convert to "merged.T1__CustomerID"
+        grain_refs = []
+        for g in self.grain_cols:
+            al, nm = g.split(".", 1)
+            grain_refs.append(f"merged.{SQLHelper.quote_identifier(al+'__'+nm)}")
+        grain_select = [f"    {g} AS {SQLHelper.quote_identifier(g.split('.')[-1])}" for g in grain_refs]
+
+        agg_select = []
+        for col_expr, func in self.group_by_aggs.items():
+            # allow user to pass merged.Alias__Col or base-alias style
+            ce = col_expr
+            if ce.startswith(f"{self.base_alias}."):
+                _, nm = ce.split(".", 1)
+                ce = f"merged.{SQLHelper.quote_identifier(self.base_alias+'__'+nm)}"
+            alias = col_expr.split('.')[-1] + "_" + func.lower()
+            agg_select.append(f"    {func.upper()}({ce}) AS {SQLHelper.quote_identifier(alias)}")
+
+        select_list = ",\n".join(grain_select + agg_select)
+        group_by_list = ", ".join(grain_refs)
+        sql = f"""final AS (
+  SELECT
+{select_list}
+  FROM merged
+  GROUP BY {group_by_list}
+)"""
+        return sql
+
+    def _generate_final_select(self, source: str) -> str:
+        if self.output_columns:
+            select_list = ",\n  ".join(self.output_columns)
+        else:
+            select_list = "*"
+
+        if self.derived_columns:
+            derived = [f"  {expr} AS {SQLHelper.quote_identifier(alias)}" for expr, alias in self.derived_columns]
+            if self.output_columns:
+                select_list += ",\n" + ",\n".join(derived)
+            else:
+                select_list = f"*,\n" + ",\n".join(derived)
+
+        return f"""SELECT
+  {select_list}
+FROM {source};"""
+
+# =============================================================================
+# SECTION F: INTERACTIVE APP (STABLE UI; JOIN IS NOW AUTO!)
+# =============================================================================
+
+class ViewBuilderApp:
+    def __init__(self, db_connection: DatabaseConnection, predefined_tables: List[Dict], auto_apply: bool = True):
+        self.db = db_connection
+        self.predefined_tables = predefined_tables
+        self.auto_apply = auto_apply
+        self.pipeline: Optional[ViewPipeline] = None
+        self.sources: Dict[str, SourceTable] = {}
+
+    def run(self):
+        try:
+            self.db.connect()
+            self._load_tables()
+            self._initialize_pipeline()
+            self.pipeline.display_current_state()
+            self._main_menu()
+        except KeyboardInterrupt:
+            Logger.warning("\nOperation cancelled by user")
+        except Exception as e:
+            Logger.error(f"Application error: {e}")
+            raise
+        finally:
+            self.db.close()
+
+    def _load_tables(self):
+        Logger.info("Loading table metadata...")
+        for i, table_def in enumerate(self.predefined_tables, 1):
+            schema = table_def.get("schema", "dbo")
+            table = table_def["table"]
+            alias = table_def.get("alias", f"T{i}")
+            Logger.debug(f"Fetching columns for {schema}.{table}...")
+            col_data = self.db.get_columns(schema, table)
+            columns = [ColumnInfo(name=name, data_type=dtype) for name, dtype in col_data]
+            source = SourceTable(schema=schema, table=table, alias=alias, columns=columns)
+            self.sources[alias] = source
+            Logger.success(f"Loaded {alias}: {schema}.{table} ({len(columns)} columns)")
+
+    def _initialize_pipeline(self):
+        print("\n" + "=" * 80)
+        print("🚀 PIPELINE INITIALIZATION")
+        print("=" * 80)
+
+        view_name = input("\n📝 Enter VIEW name (e.g., dbo.CustomerView): ").strip() or "dbo.MyView"
+        if "." not in view_name:
+            view_name = "dbo." + view_name
+
+        print("\n📦 Available tables:")
+        for alias, src in self.sources.items():
+            print(f"   • {alias}: {src.schema}.{src.table}")
+
+        base_alias = input("\n🎯 Choose base table alias (default: T1): ").strip() or "T1"
+        if base_alias not in self.sources:
+            Logger.error(f"Invalid alias: {base_alias}")
+            sys.exit(1)
+
+        base_source = self.sources[base_alias]
+        base_source.display_columns()
+
+        print(f"\n🎯 Select grain columns (comma-separated numbers):")
+        print("   (These define the unique row identifier)")
+        grain_input = input("   Enter column numbers: ").strip()
+        if not grain_input:
+            grain_cols = [f"{base_alias}.{base_source.columns[0].name}"]
+            Logger.warning(f"Using default grain: {grain_cols[0]}")
+        else:
+            indices = [int(x) for x in grain_input.split(',') if x.strip().isdigit()]
+            grain_cols = [f"{base_alias}.{base_source.columns[i-1].name}" for i in indices if 1 <= i <= len(base_source.columns)]
+
+        self.pipeline = ViewPipeline(view_name, base_alias, grain_cols, policy=InferencePolicy())
+        for source in self.sources.values():
+            self.pipeline.add_source(source)
+        Logger.success("Pipeline initialized!")
+
+    def _main_menu(self):
+        while True:
+            print("\n" + "=" * 80)
+            print("📋 MAIN MENU")
+            print("=" * 80)
+            print("1. 📊 Show current view structure")
+            print("2. ✂️  Select/deselect columns")
+            print("3. 🧹 Apply transformations (TRIM, UPPER, etc.)")
+            print("4. 🔗 Add child table join [AUTO-INFER]")
+            print("5. 🔍 Add filter (WHERE condition)")
+            print("6. 📊 Add GROUP BY aggregates")
+            print("7. ➕ Add derived column")
+            print("8. 🏷️  Rename columns")
+            print("9. 🎨 Choose output columns")
+            print("10. 💾 Generate and apply VIEW")
+            print("0. 🚪 Exit")
+            print("=" * 80)
+
+            choice = input("\n👉 Select an option: ").strip()
+            try:
+                if choice == '1':   self._show_structure()
+                elif choice == '2': self._select_columns()
+                elif choice == '3': self._apply_transforms()
+                elif choice == '4': self._add_join_auto()
+                elif choice == '5': self._add_filter()
+                elif choice == '6': self._add_group_by()
+                elif choice == '7': self._add_derived()
+                elif choice == '8': self._rename_columns()
+                elif choice == '9': self._choose_output()
+                elif choice == '10': self._generate_and_apply()
+                elif choice == '0':
+                    Logger.info("Goodbye!")
+                    break
+                else:
+                    Logger.warning("Invalid choice. Please try again.")
+            except Exception as e:
+                Logger.error(f"Operation failed: {e}")
+                import traceback
+                Logger.debug(traceback.format_exc())
+
+    def _show_structure(self):
+        self.pipeline.display_current_state()
+        print("\n📚 DETAILED COLUMN INFORMATION:")
+        for alias, source in self.pipeline.sources.items():
+            source.display_columns()
+
+    def _select_columns(self):
+        print("\n" + "=" * 80)
+        print("✂️  COLUMN SELECTION")
+        print("=" * 80)
+        for alias, source in self.pipeline.sources.items():
+            source.display_columns()
+            print(f"\n📝 Select columns to KEEP in {alias}")
+            print("   Enter column numbers (comma-separated) or 'all' to keep all:")
+            selection = input("   ").strip().lower()
+            if selection == 'all':
+                for col in source.columns: col.is_selected = True
+                Logger.success(f"All columns selected for {alias}")
+            elif selection:
+                indices = [int(x) for x in selection.split(',') if x.strip().isdigit()]
+                for col in source.columns: col.is_selected = False
+                for i in indices:
+                    if 1 <= i <= len(source.columns):
+                        source.columns[i-1].is_selected = True
+                Logger.success(f"Selected {len(indices)} columns for {alias}")
+        self._preview_tip()
+
+    def _apply_transforms(self):
+        print("\n" + "=" * 80)
+        print("🧹 DATA TRANSFORMATIONS")
+        print("=" * 80)
+        print("Available: 1.TRIM  2.UPPER  3.LOWER  4.COALESCE  5.REPLACE  6.CAST")
+
+        source, columns = self._pick_source_and_columns()
+        if not source or not columns: return
+        transform_choice = input("\n🔧 Choose transformation (1-6): ").strip()
+
+        if transform_choice == '1':
+            for col in columns:
+                col.transform = f"LTRIM(RTRIM({source.alias}.{SQLHelper.quote_identifier(col.name)}))"
+            Logger.success("Applied TRIM")
+
+        elif transform_choice == '2':
+            for col in columns:
+                col.transform = f"UPPER({source.alias}.{SQLHelper.quote_identifier(col.name)})"
+            Logger.success("Applied UPPER")
+
+        elif transform_choice == '3':
+            for col in columns:
+                col.transform = f"LOWER({source.alias}.{SQLHelper.quote_identifier(col.name)})"
+            Logger.success("Applied LOWER")
+
+        elif transform_choice == '4':
+            default_val = input("Default value for NULL: ").strip()
+            for col in columns:
+                col.transform = f"COALESCE({source.alias}.{SQLHelper.quote_identifier(col.name)}, {SQLHelper.quote_literal(default_val)})"
+            Logger.success("Applied COALESCE")
+
+        elif transform_choice == '5':
+            find_text = input("Find text: ").strip()
+            replace_text = input("Replace with: ").strip()
+            for col in columns:
+                col.transform = f"REPLACE({source.alias}.{SQLHelper.quote_identifier(col.name)}, {SQLHelper.quote_literal(find_text)}, {SQLHelper.quote_literal(replace_text)})"
+            Logger.success("Applied REPLACE")
+
+        elif transform_choice == '6':
+            data_type = input("Target data type (e.g., INT, DECIMAL(18,2), DATE): ").strip().upper()
+            for col in columns:
+                col.transform = f"TRY_CAST({source.alias}.{SQLHelper.quote_identifier(col.name)} AS {data_type})"
+            Logger.success(f"Applied CAST to {data_type}")
+        else:
+            Logger.warning("Invalid transformation choice")
+            return
+
+        self._preview_tip()
+
+    def _add_join_auto(self):
+        """
+        Auto-infers join strategy to PRESERVE GRAIN:
+        - Ask only for: child alias + matching keys.
+        - Inference engine handles cardinality + plan.
+        """
+        print("\n" + "=" * 80)
+        print("🔗 ADD CHILD TABLE JOIN [AUTO-INFER]")
+        print("=" * 80)
+
+        base_alias = self.pipeline.base_alias
+        print("\n📦 Available child tables:")
+        for alias in self.pipeline.sources:
+            if alias != base_alias:
+                src = self.pipeline.sources[alias]
+                print(f"   • {alias}: {src.schema}.{src.table}")
+
+        right_alias = input("\n🎯 Choose child table alias: ").strip()
+        if right_alias not in self.pipeline.sources or right_alias == base_alias:
+            Logger.error("Invalid alias")
+            return
+
+        base_source = self.pipeline.sources[base_alias]
+        child_source = self.pipeline.sources[right_alias]
+
+        print(f"\n🔑 Base table ({base_alias}) columns:")
+        bcols = base_source.get_selected_columns()
+        for i, col in enumerate(bcols, 1): print(f"   {i}. {col.name}")
+        left_keys_input = input("\nSelect join key column numbers (comma-separated): ").strip()
+        left_indices = [int(x) for x in left_keys_input.split(',') if x.strip().isdigit()]
+        left_keys = [bcols[i-1].name for i in left_indices if 1 <= i <= len(bcols)]
+
+        print(f"\n🔑 Child table ({right_alias}) columns:")
+        ccols = child_source.get_selected_columns()
+        for i, col in enumerate(ccols, 1): print(f"   {i}. {col.name}")
+        right_keys_input = input("\nSelect matching child key column numbers (comma-separated): ").strip()
+        right_indices = [int(x) for x in right_keys_input.split(',') if x.strip().isdigit()]
+        right_keys = [ccols[i-1].name for i in right_indices if 1 <= i <= len(ccols)]
+
+        if len(left_keys) != len(right_keys):
+            Logger.error("Number of left and right keys must match")
+            return
+
+        key_pairs = [(f"{base_alias}.{lk}", f"{right_alias}.{rk}") for lk, rk in zip(left_keys, right_keys)]
+
+        # Infer and plan
+        engine = JoinInferenceEngine(self.db, self.sources, self.pipeline.policy)
+        planned = engine.plan_to_preserve_grain(
+            base_alias=base_alias,
+            grain_cols_fullnames=self.pipeline.grain_cols,
+            right_alias=right_alias,
+            key_pairs=key_pairs
+        )
+        self.pipeline.add_join(planned)
+        Logger.success(f"Added {planned.join_type} join to {right_alias} [{planned.strategy.value}]")
+        self._preview_tip()
+
+    def _add_filter(self):
+        print("\n" + "=" * 80)
+        print("🔍 ADD FILTER (WHERE CONDITION)")
+        print("=" * 80)
+        print("\nℹ️  Tip: Use cleaned names like T1_clean.Alias__Col or merged.Alias__Col")
+        condition = input("\n📝 Enter SQL condition: ").strip()
+        if condition:
+            self.pipeline.filters.append(condition)
+            Logger.success("Filter added")
+            self._preview_tip()
+        else:
+            Logger.warning("No filter entered")
+
+    def _add_group_by(self):
+        print("\n" + "=" * 80)
+        print("📊 ADD GROUP BY AGGREGATES")
+        print("=" * 80)
+        print("\nℹ️  Applies after all joins at the selected grain")
+        print("Format: column_expression|FUNCTION  (e.g., merged.T2__Amount|SUM)")
+        print("Press Enter on empty line to finish")
+
+        agg_map = {}
+        while True:
+            line = input("\n> ").strip()
+            if not line: break
+            if '|' not in line:
+                Logger.warning("Format: expression|FUNCTION")
+                continue
+            expr, func = [x.strip() for x in line.split('|', 1)]
+            agg_map[expr] = func.upper()
+            Logger.debug(f"Added: {func}({expr})")
+
+        if agg_map:
+            self.pipeline.group_by_aggs = agg_map
+            Logger.success(f"Added {len(agg_map)} aggregates")
+            self._preview_tip()
+        else:
+            Logger.warning("No aggregates added")
+
+    def _add_derived(self):
+        print("\n" + "=" * 80)
+        print("➕ ADD DERIVED COLUMN")
+        print("=" * 80)
+        expression = input("\n📝 Enter SQL expression: ").strip()
+        if not expression:
+            Logger.warning("No expression entered"); return
+        alias_name = input("📝 Enter column alias name: ").strip() or "DerivedColumn"
+        self.pipeline.derived_columns.append((expression, alias_name))
+        Logger.success(f"Added derived column: {alias_name}")
+        self._preview_tip()
+
+    def _rename_columns(self):
+        print("\n" + "=" * 80)
+        print("🏷️  RENAME COLUMNS")
+        print("=" * 80)
+        print("Use format: Alias.ColumnName -> NewName   (e.g., T1.CustomerID -> CustID)")
+        while True:
+            line = input("\n> ").strip()
+            if not line: break
+            if '->' not in line:
+                Logger.warning("Format: alias.column -> new_name")
+                continue
+            old_name, new_name = [x.strip() for x in line.split('->', 1)]
+            if '.' not in old_name:
+                Logger.warning("Use format: alias.column -> new_name")
+                continue
+            alias, col_name = old_name.split('.', 1)
+            if alias in self.pipeline.sources:
+                src = self.pipeline.sources[alias]
+                for col in src.columns:
+                    if col.name == col_name:
+                        col.new_alias = new_name
+                        Logger.success(f"Renamed {old_name} -> {new_name}")
+                        break
+                else:
+                    Logger.warning(f"Column not found: {old_name}")
+            else:
+                Logger.warning(f"Alias not found: {alias}")
+        self._preview_tip()
+
+    def _choose_output(self):
+        print("\n" + "=" * 80)
+        print("🎨 CHOOSE OUTPUT COLUMNS")
+        print("=" * 80)
+        print("Leave empty for all columns (*)")
+        print("Use names like merged.T1__CustomerID or expressions with AS")
+        cols_input = input("> ").strip()
+        if cols_input:
+            cols = [c.strip() for c in cols_input.split(',') if c.strip()]
+            self.pipeline.output_columns = cols
+            Logger.success(f"Set {len(cols)} output columns")
+        else:
+            self.pipeline.output_columns = []
+            Logger.success("Using all columns (*)")
+        self._preview_tip()
+
+    def _generate_and_apply(self):
+        print("\n" + "=" * 80)
+        print("💾 GENERATE AND APPLY VIEW")
+        print("=" * 80)
+        try:
+            sql = self.pipeline.generate_sql()
+            print("\n" + "=" * 80)
+            print("📄 GENERATED SQL:")
+            print("=" * 80)
+            print(sql)
+            print("=" * 80)
+            confirm = input("\n❓ Apply this view to the database? (y/n): ").strip().lower()
+            if confirm == 'y':
+                self.db.cursor.execute(sql)
+                self.db.conn.commit()
+                Logger.success(f"View '{self.pipeline.view_name}' created/updated successfully!")
+                print("\n✅ Ready to use in BI tools")
+            else:
+                Logger.info("View not applied")
+        except Exception as e:
+            Logger.error(f"Failed to generate/apply view: {e}")
+            import traceback
+            print(traceback.format_exc())
+
+    def _preview_tip(self):
+        try:
+            self.pipeline.display_current_state()
+            if self.auto_apply:
+                print("\n💡 Tip: Use menu option 10 to generate and apply the view")
+        except Exception as e:
+            Logger.error(f"Preview failed: {e}")
+
+    def _pick_source_and_columns(self) -> Tuple[Optional[SourceTable], List[ColumnInfo]]:
+        print("\n📦 Available tables:")
+        for alias in self.pipeline.sources: print(f"   • {alias}")
+        alias = input("\n🎯 Choose table alias: ").strip()
+        if alias not in self.pipeline.sources:
+            Logger.error("Invalid alias"); return None, []
+        source = self.pipeline.sources[alias]
+        selected_cols = source.get_selected_columns()
+        print(f"\n📊 Columns in {alias}:")
+        for i, col in enumerate(selected_cols, 1):
+            print(f"   {i}. {col.name}")
+        cols_input = input("\n📝 Select column numbers (comma-separated): ").strip()
+        indices = [int(x) for x in cols_input.split(',') if x.strip().isdigit()]
+        columns = [selected_cols[i-1] for i in indices if 1 <= i <= len(selected_cols)]
+        if not columns:
+            Logger.warning("No columns selected")
+            return source, []
+        return source, columns
+
+# =============================================================================
+# SECTION G: MAIN (STABLE)
+# =============================================================================
+
+def main():
+    print("\n" + "=" * 80)
+    print("🎉 ULTIMATE SQL VIEW PIPELINE BUILDER – AUTO CARDINALITY")
+    print("=" * 80)
+    print("\n✨ This version auto-preserves your declared grain. Just map keys; I’ll do the rest.")
+    print("   • Auto ONE→MANY / MANY→ONE / MANY↔MANY detection")
+    print("   • Picks LATEST (if timestamp) else AGGREGATE to prevent fanout")
+    print("   • Safe Alias__Column names avoid duplicate column errors")
+    print("=" * 80)
+
+    servers = [
+        {
+            "label": "Local Development Server",
+            "server": r"localhost\SQLEXPRESS",
+            "database": "BigDataDB",
+            "auth_type": "windows",
+            "user": None,
+            "tables": [
+                {"schema": "dbo", "table": "BusRegistry", "alias": "T1"},
+                {"schema": "dbo", "table": "FuelConsumption", "alias": "T2"},
+                {"schema": "dbo", "table": "MaintenanceRecords", "alias": "T3"},
+                {"schema": "dbo", "table": "DriverAssignments", "alias": "T4"},
+                {"schema": "dbo", "table": "RoutePerformance", "alias": "T5"}
+            ]
+        }
+    ]
+
+    print("\n" + "=" * 80)
+    print("📡 AVAILABLE SERVERS")
+    print("=" * 80)
+    for i, server in enumerate(servers, 1):
+        print(f"{i}. {server['label']}")
+        print(f"   Server: {server['server']}")
+        print(f"   Database: {server['database']}")
+        print(f"   Auth: {server['auth_type'].upper()}")
+        print(f"   Tables: {len(server.get('tables', []))}\n")
+
+    selection = input("👉 Select server number (or 'q' to quit): ").strip().lower()
+    if selection == 'q':
+        Logger.info("Goodbye!")
+        return
+
+    try:
+        idx = int(selection) - 1
+        if idx < 0 or idx >= len(servers):
+            Logger.error("Invalid server selection"); return
+        cfg = servers[idx]
+
+        db_conn = DatabaseConnection(
+            label=cfg["label"],
+            server=cfg["server"],
+            database=cfg["database"],
+            auth_type=cfg["auth_type"],
+            user=cfg.get("user")
+        )
+
+        app = ViewBuilderApp(db_connection=db_conn, predefined_tables=cfg.get("tables", []), auto_apply=True)
+        app.run()
+
+        print("\n" + "=" * 80)
+        print("✅ SESSION COMPLETE")
+        print("=" * 80)
+        print("\n📌 Next Steps:")
+        print("   1. Open your BI tool")
+        print("   2. Connect to SQL Server")
+        print(f"   3. Use the view: {app.pipeline.view_name if app.pipeline else 'your_view'}")
+        print("   4. Build your dashboard!")
+        print("=" * 80 + "\n")
+
+    except KeyboardInterrupt:
+        Logger.warning("\n\nOperation cancelled by user")
+    except Exception as e:
+        Logger.error(f"Application error: {e}")
+        import traceback
+        Logger.debug("\n" + traceback.format_exc())
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
