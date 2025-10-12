@@ -1,0 +1,262 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+
+
+import pyodbc
+import sys
+import time
+from decimal import Decimal
+
+# =========================
+# Config
+# =========================
+DEFAULT_SERVER = r"localhost\SQLEXPRESS"
+BATCH_SIZE = 10_000        # how many rows to fetch per round-trip
+PRINT_CHUNK = 5_000        # print values in chunks to avoid huge single-line output
+
+# =========================
+# Logging helpers
+# =========================
+def log(msg):
+    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+def is_number(v):
+    return isinstance(v, (int, float, Decimal))
+
+def quote_string(s):
+    # SQL style single-quote escaping for display
+    return "'" + str(s).replace("'", "''") + "'"
+
+def format_value(v):
+    if v is None:
+        return None
+    if is_number(v):
+        # Keep as-is (no quotes). For Decimal, convert to string nicely.
+        return str(v)
+    # Treat everything else as string
+    return quote_string(v)
+
+def choose(prompt, options):
+    """Simple numbered chooser: returns the selected item."""
+    if not options:
+        raise ValueError("No options available.")
+    for i, item in enumerate(options, 1):
+        print(f"  {i}. {item}")
+    while True:
+        pick = input(f"{prompt} [1-{len(options)}]: ").strip()
+        try:
+            idx = int(pick)
+            if 1 <= idx <= len(options):
+                return options[idx - 1]
+        except ValueError:
+            pass
+        print("Invalid choice. Try again.")
+
+# =========================
+# Connection helpers
+# =========================
+def connect_server(server):
+    # Connect to master first to enumerate databases
+    conn_str = (
+        f"DRIVER={{ODBC Driver 17 for SQL Server}};"
+        f"SERVER={server};"
+        f"DATABASE=master;"
+        f"Trusted_Connection=yes;"
+    )
+    return pyodbc.connect(conn_str, autocommit=True)
+
+def connect_database(server, database):
+    conn_str = (
+        f"DRIVER={{ODBC Driver 17 for SQL Server}};"
+        f"SERVER={server};"
+        f"DATABASE={database};"
+        f"Trusted_Connection=yes;"
+    )
+    return pyodbc.connect(conn_str, autocommit=False)
+
+# =========================
+# Main logic
+# =========================
+def list_databases(conn_master):
+    # Only online, user databases + system if you want; filter state_desc='ONLINE'
+    sql = """
+    SELECT name
+    FROM sys.databases
+    WHERE state_desc = 'ONLINE'
+    ORDER BY name;
+    """
+    cur = conn_master.cursor()
+    return [row[0] for row in cur.execute(sql).fetchall()]
+
+def list_tables(conn_db):
+    # Show user tables from all schemas
+    sql = """
+    SELECT QUOTENAME(s.name) + '.' + QUOTENAME(t.name) AS FullName
+    FROM sys.tables t
+    JOIN sys.schemas s ON s.schema_id = t.schema_id
+    ORDER BY s.name, t.name;
+    """
+    cur = conn_db.cursor()
+    return [row[0] for row in cur.execute(sql).fetchall()]
+
+def list_columns(conn_db, schema_table):
+    # schema_table is like [dbo].[BusRegistry]
+    sql = f"""
+    SELECT QUOTENAME(c.name) AS ColName, ty.name AS TypeName
+    FROM sys.columns c
+    JOIN sys.types ty ON ty.user_type_id = c.user_type_id
+    JOIN sys.tables t ON t.object_id = c.object_id
+    JOIN sys.schemas s ON s.schema_id = t.schema_id
+    WHERE QUOTENAME(s.name) + '.' + QUOTENAME(t.name) = ?
+    ORDER BY c.column_id;
+    """
+    cur = conn_db.cursor()
+    cols = []
+    for col_name, type_name in cur.execute(sql, schema_table):
+        cols.append((col_name, type_name))
+    return cols
+
+def stream_distinct_values(conn_db, full_table, col_quoted, batch_size=BATCH_SIZE):
+    """
+    Streams DISTINCT values for a single column.
+    Returns a generator yielding lists (batches) of Python values.
+    """
+    sql = f"""
+    SET NOCOUNT ON;
+    SELECT DISTINCT {col_quoted}
+    FROM {full_table}
+    WHERE {col_quoted} IS NOT NULL
+    ORDER BY {col_quoted};
+    """
+    cur = conn_db.cursor()
+    cur.arraysize = batch_size
+    cur.execute(sql)
+
+    while True:
+        rows = cur.fetchmany(batch_size)
+        if not rows:
+            break
+        # Each row is a single column value
+        yield [r[0] for r in rows]
+
+def main():
+    log("Distinct streamer started.")
+    # -------------------------
+    # 1) Connect to server
+    # -------------------------
+    server = input(f"Server [{DEFAULT_SERVER}]: ").strip() or DEFAULT_SERVER
+    try:
+        conn_master = connect_server(server)
+    except Exception as e:
+        log(f"❌ Failed to connect to server '{server}': {e}")
+        sys.exit(1)
+    log(f"Connected to server: {server}")
+
+    # -------------------------
+    # 2) Choose database
+    # -------------------------
+    try:
+        dbs = list_databases(conn_master)
+    except Exception as e:
+        log(f"❌ Failed to list databases: {e}")
+        sys.exit(1)
+
+    # Put BigDataDB first if present (quality of life)
+    dbs_sorted = sorted(dbs, key=lambda x: (x != "BigDataDB", x.lower()))
+    database = choose("Choose a database", dbs_sorted)
+
+    try:
+        conn_db = connect_database(server, database)
+    except Exception as e:
+        log(f"❌ Failed to connect to database '{database}': {e}")
+        sys.exit(1)
+    log(f"Using database: {database}")
+
+    # -------------------------
+    # 3) Choose table
+    # -------------------------
+    try:
+        tables = list_tables(conn_db)
+    except Exception as e:
+        log(f"❌ Failed to list tables: {e}")
+        sys.exit(1)
+
+    # Put dbo.BusRegistry first if present
+    preferred = "[dbo].[BusRegistry]"
+    tables_sorted = sorted(tables, key=lambda x: (x != preferred, x.lower()))
+    full_table = choose("Choose a table (schema.table)", tables_sorted)
+
+    # -------------------------
+    # 4) Choose column
+    # -------------------------
+    try:
+        cols = list_columns(conn_db, full_table)
+    except Exception as e:
+        log(f"❌ Failed to list columns for {full_table}: {e}")
+        sys.exit(1)
+
+    # Display with types to help the user
+    col_labels = [f"{name}  ({typ})" for name, typ in cols]
+    pick_label = choose("Choose a column", col_labels)
+    pick_idx = col_labels.index(pick_label)
+    col_quoted, col_type = cols[pick_idx]
+    log(f"Selected column: {col_quoted}  (SQL type: {col_type})")
+
+    # -------------------------
+    # 5) Stream DISTINCT values
+    # -------------------------
+    log(f"Streaming DISTINCT {col_quoted} FROM {full_table} in batches of {BATCH_SIZE}...")
+    total_sent = 0
+    total_unique = 0
+
+    # We can print as we go without building a massive string in memory.
+    # But we must also ensure uniqueness in case the driver returns duplicates in separate batches
+    # (it shouldn't, because of DISTINCT, but we keep a set for safety and for counting).
+    seen = set()
+    buffer_print = []  # holds formatted values to print in chunks
+
+    try:
+        for batch in stream_distinct_values(conn_db, full_table, col_quoted, BATCH_SIZE):
+            total_sent += len(batch)
+            for v in batch:
+                if v in seen:
+                    continue
+                seen.add(v)
+                total_unique += 1
+                # Format by type: strings -> 'x', numbers -> x (no quotes)
+                formatted = format_value(v)
+                if formatted is None:
+                    continue
+                buffer_print.append(formatted)
+
+                # Print by chunks so console stays responsive
+                if len(buffer_print) >= PRINT_CHUNK:
+                    print(", ".join(buffer_print))
+                    buffer_print = []
+
+        # Print any tail
+        if buffer_print:
+            print(", ".join(buffer_print))
+
+        log(f"Done. Rows received from server (already DISTINCTed): {total_sent}")
+        log(f"Unique values collected client-side: {total_unique}")
+
+    except KeyboardInterrupt:
+        log("Interrupted by user.")
+    except Exception as e:
+        log(f"❌ Error during streaming: {e}")
+    finally:
+        try:
+            conn_db.close()
+        except Exception:
+            pass
+        try:
+            conn_master.close()
+        except Exception:
+            pass
+
+    log("Finished.")
+
+if __name__ == "__main__":
+    main()
