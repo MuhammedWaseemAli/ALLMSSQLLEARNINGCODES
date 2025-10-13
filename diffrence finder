@@ -1,0 +1,44 @@
+# difference_finder.py
+# Run this file in VS Code or Command Prompt using:  py difference_finder.py
+
+def parse_input(raw_input):
+    """Parse user input into a clean Python list (supports numbers or quoted strings)."""
+    raw_input = raw_input.strip()
+    if not raw_input:
+        return []
+    # Split by commas and strip spaces/quotes
+    items = [x.strip().strip("'").strip('"') for x in raw_input.split(",")]
+    # Convert numeric strings to integers where possible
+    result = []
+    for i in items:
+        if i.replace('.', '', 1).isdigit():  # supports integer or float
+            result.append(float(i) if '.' in i else int(i))
+        else:
+            result.append(i)
+    return result
+
+def format_output(result_list):
+    """Format output as per example."""
+    if not result_list:
+        return ""
+    if all(isinstance(x, (int, float)) for x in result_list):
+        return ",".join(map(str, result_list))
+    else:
+        return ",".join(f"'{x}'" for x in result_list)
+
+def main():
+    input1 = input("Enter input1 (comma-separated): ").strip()
+    input2 = input("Enter input2 (comma-separated): ").strip()
+
+    list1 = parse_input(input1)
+    list2 = parse_input(input2)
+
+    # Use set difference for speed, but preserve order
+    set2 = set(list2)
+    difference = [x for x in list1 if x not in set2]
+
+    print("\nOutput:")
+    print(format_output(difference))
+
+if __name__ == "__main__":
+    main()
