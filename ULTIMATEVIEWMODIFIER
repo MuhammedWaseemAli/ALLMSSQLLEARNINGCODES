@@ -1,0 +1,791 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Ultimate View Modifier for MS SQL (SSMS) - pyodbc + getpass
+===========================================================
+- You pre-fill SERVER, DATABASE, and SQL_USERNAME below.
+- Script asks only for PASSWORD via getpass in CMD.
+- Lists all views by number -> pick one.
+- Shows view columns by number (name + datatype).
+- Main loop: choose a function (independent builders):
+    (1) Add Computed Column (Excel-like, per-row, no aggregation)
+    (2) Add Lookup Column from Another Table
+- You can run Function 1 and 2 any number of times in any order.
+- Each apply regenerates: CREATE OR ALTER VIEW <schema.view>
+  using a safe wrapper (CTE "base" around original SELECT) and
+  appends your computed/lookup columns.
+- Backs up the previous T-SQL definition to ./backups/<view>_YYYYmmdd_HHMMSS.sql
+- Shows SQL preview before applying.
+"""
+
+import os
+import re
+import sys
+import time
+import getpass
+from datetime import datetime
+from typing import List, Dict, Tuple, Optional
+
+import pyodbc
+
+# =====================================================================
+# SECTION 0: CONFIG - YOU FILL THESE THREE ONLY (password asked at run)
+# =====================================================================
+SERVER = r"localhost\SQLEXPRESS"
+DATABASE = "VIEWMODIFIER"
+SQL_USERNAME = "sa"
+AUTH_MODE = "windows"
+# Optional: default preview sample size
+PREVIEW_TOP_N = 20
+
+# =====================================================================
+# SECTION 1: LOW-LEVEL HELPERS (REUSABLE, DO NOT MIX WITH FUNCTIONS)
+# =====================================================================
+
+def log_info(msg: str):
+    print(f"[INFO  {time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+def log_ok(msg: str):
+    print(f"[OK    {time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+def log_warn(msg: str):
+    print(f"[WARN  {time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+def log_err(msg: str):
+    print(f"[ERROR {time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+def q_ident(name: str) -> str:
+    """Quote SQL identifier with [brackets], support dotted names."""
+    parts = [p for p in name.split('.') if p]
+    return ".".join(f"[{p.strip('[]')}]" for p in parts)
+'''
+def connect_with_password(server: str, database: str, username: str) -> pyodbc.Connection:
+    pwd = getpass.getpass("Enter SQL password (will not echo): ")
+    conn_str = (
+        f"DRIVER={{ODBC Driver 17 for SQL Server}};"
+        f"SERVER={server};DATABASE={database};UID={username};PWD={pwd};"
+        "TrustServerCertificate=Yes;"
+    )
+    log_info(f"Connecting to {server} / {database} as {username} ...")
+    conn = pyodbc.connect(conn_str, autocommit=False)
+    log_ok("Connected.")
+    return conn
+'''
+def connect_mssql(server: str, database: str, auth_mode: str, username: Optional[str] = None) -> pyodbc.Connection:
+    """
+    Creates a pyodbc connection for either:
+      - Windows Authentication (Integrated Security)
+      - SQL Authentication (UID/PWD via getpass)
+    """
+    driver = "{ODBC Driver 17 for SQL Server}"  # If you have 18 installed, you can switch to 18.
+
+    if auth_mode.lower() == "windows":
+        # Windows Authentication (no UID/PWD; uses current Windows user)
+        conn_str = (
+            f"DRIVER={driver};"
+            f"SERVER={server};DATABASE={database};"
+            f"Trusted_Connection=Yes;"
+            f"TrustServerCertificate=Yes;"
+        )
+        log_info(f"Connecting (Windows Auth) to {server} / {database} ...")
+        conn = pyodbc.connect(conn_str, autocommit=False)
+
+    elif auth_mode.lower() == "sql":
+        if not username:
+            raise ValueError("SQL auth selected but no SQL_USERNAME provided.")
+        pwd = getpass.getpass("Enter SQL password (will not echo): ")
+        conn_str = (
+            f"DRIVER={driver};"
+            f"SERVER={server};DATABASE={database};"
+            f"UID={username};PWD={pwd};"
+            f"TrustServerCertificate=Yes;"
+        )
+        log_info(f"Connecting (SQL Auth) to {server} / {database} as {username} ...")
+        conn = pyodbc.connect(conn_str, autocommit=False)
+
+    else:
+        raise ValueError("AUTH_MODE must be 'windows' or 'sql'.")
+
+    log_ok("Connected.")
+    return conn
+
+def fetch_views(conn: pyodbc.Connection) -> List[Tuple[str, str]]:
+    """
+    Returns list of (schema_name, view_name) for user views.
+    """
+    sql = """
+    SELECT s.name AS schema_name, v.name AS view_name
+    FROM sys.views v
+    JOIN sys.schemas s ON v.schema_id = s.schema_id
+    WHERE v.is_ms_shipped = 0
+    ORDER BY s.name, v.name;
+    """
+    cur = conn.cursor()
+    rows = cur.execute(sql).fetchall()
+    return [(r.schema_name, r.view_name) for r in rows]
+
+def fetch_tables(conn: pyodbc.Connection) -> List[Tuple[str, str]]:
+    """
+    Returns list of (schema_name, table_name) for user tables.
+    """
+    sql = """
+    SELECT s.name AS schema_name, t.name AS table_name
+    FROM sys.tables t
+    JOIN sys.schemas s ON t.schema_id = s.schema_id
+    WHERE t.is_ms_shipped = 0
+    ORDER BY s.name, t.name;
+    """
+    cur = conn.cursor()
+    rows = cur.execute(sql).fetchall()
+    return [(r.schema_name, r.table_name) for r in rows]
+
+def fetch_columns_for_view(conn: pyodbc.Connection, schema: str, view: str) -> List[Dict]:
+    """
+    Returns ordered columns for a view with type info.
+    """
+    sql = """
+    SELECT c.ORDINAL_POSITION, c.COLUMN_NAME, c.DATA_TYPE
+    FROM INFORMATION_SCHEMA.COLUMNS c
+    WHERE c.TABLE_SCHEMA = ? AND c.TABLE_NAME = ?
+    ORDER BY c.ORDINAL_POSITION;
+    """
+    cur = conn.cursor()
+    rows = cur.execute(sql, schema, view).fetchall()
+    cols = []
+    for r in rows:
+        cols.append({
+            "ordinal": int(r.ORDINAL_POSITION),
+            "name": r.COLUMN_NAME,
+            "data_type": r.DATA_TYPE.lower()
+        })
+    return cols
+
+def fetch_columns_for_table(conn: pyodbc.Connection, schema: str, table: str) -> List[Dict]:
+    """
+    Returns ordered columns for a table with type info.
+    """
+    sql = """
+    SELECT c.ORDINAL_POSITION, c.COLUMN_NAME, c.DATA_TYPE
+    FROM INFORMATION_SCHEMA.COLUMNS c
+    WHERE c.TABLE_SCHEMA = ? AND c.TABLE_NAME = ?
+    ORDER BY c.ORDINAL_POSITION;
+    """
+    cur = conn.cursor()
+    rows = cur.execute(sql, schema, table).fetchall()
+    cols = []
+    for r in rows:
+        cols.append({
+            "ordinal": int(r.ORDINAL_POSITION),
+            "name": r.COLUMN_NAME,
+            "data_type": r.DATA_TYPE.lower()
+        })
+    return cols
+
+def get_view_definition(conn: pyodbc.Connection, schema: str, view: str) -> str:
+    """
+    Returns current T-SQL text of the view (SELECT ...).
+    """
+    cur = conn.cursor()
+    obj = f"{schema}.{view}"
+    sql = "SELECT sm.definition FROM sys.sql_modules sm WHERE sm.object_id = OBJECT_ID(?);"
+    row = cur.execute(sql, obj).fetchone()
+    if not row:
+        raise RuntimeError(f"View definition not found for {obj}")
+    return row.definition
+
+def backup_sql_text(schema: str, view: str, sql_text: str):
+    os.makedirs("backups", exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    fname = f"backups/{schema}.{view}_{ts}.sql"
+    with open(fname, "w", encoding="utf-8") as f:
+        f.write(sql_text)
+    log_ok(f"Backed up previous SQL to: {fname}")
+
+def is_numeric_type(dt: str) -> bool:
+    return dt in {"int", "bigint", "smallint", "tinyint", "decimal", "numeric", "float", "real", "money", "smallmoney", "bit"}
+
+def is_text_type(dt: str) -> bool:
+    return dt in {"varchar", "nvarchar", "char", "nchar", "text", "ntext"}
+
+def is_datetime_type(dt: str) -> bool:
+    return dt in {"date", "datetime", "datetime2", "smalldatetime", "datetimeoffset", "time"}
+
+def pick_from_numbered(items: List[str], prompt: str) -> int:
+    """
+    Print a numbered list (1..N) of strings and return the index chosen (0-based).
+    """
+    for i, s in enumerate(items, 1):
+        print(f"{i:>3}) {s}")
+    while True:
+        val = input(f"{prompt} [1-{len(items)}]: ").strip()
+        if not val.isdigit():
+            print("Enter a number.")
+            continue
+        k = int(val)
+        if 1 <= k <= len(items):
+            return k - 1
+        print("Out of range.")
+
+def yn(prompt: str, default_yes=True) -> bool:
+    y = "Y/n" if default_yes else "y/N"
+    while True:
+        v = input(f"{prompt} ({y}): ").strip().lower()
+        if v == "" and default_yes:
+            return True
+        if v == "" and not default_yes:
+            return False
+        if v in {"y", "yes"}:
+            return True
+        if v in {"n", "no"}:
+            return False
+        print("Please answer y or n.")
+
+# =====================================================================
+# SECTION 2: VIEW BUILD CONTEXT (ACCUMULATED CHANGES THIS SESSION)
+# =====================================================================
+
+class ViewBuildContext:
+    """
+    Holds accumulated additions for the target view.
+    Each time we apply, we re-fetch current view SQL and wrap it:
+        WITH base AS (<current_sql>)
+        SELECT base.*, [new cols...]
+        FROM base
+        <joins/applies...>
+    """
+    def __init__(self, schema: str, view: str):
+        self.schema = schema
+        self.view = view
+
+        # Computed columns to append: list of tuples (sql_expr, new_name)
+        self.computed_cols: List[Tuple[str, str]] = []
+
+        # Join/apply blocks to add (strings). For each addition we also add select list entries
+        # mapping alias + return col into new_name. E.g.,
+        # joins: ["OUTER APPLY (SELECT TOP 1 t.Notation AS ret FROM ... ) OA1"]
+        # lookup_cols: [("OA1.ret", "FinancialMonth")]
+        self.join_blocks: List[str] = []
+        self.lookup_cols: List[Tuple[str, str]] = []
+
+        self.join_counter = 0
+
+    def next_join_alias(self) -> str:
+        self.join_counter += 1
+        return f"J{self.join_counter}"
+
+    def add_computed(self, sql_expr: str, new_name: str):
+        self.computed_cols.append((sql_expr, new_name))
+
+    def add_lookup(self, join_block: str, returned_expr: str, new_name: str):
+        self.join_blocks.append(join_block)
+        self.lookup_cols.append((returned_expr, new_name))
+
+    def build_create_or_alter(self, base_sql: str) -> str:
+        """
+        Build the final CREATE OR ALTER VIEW statement text.
+        """
+        base_sql_clean = base_sql.strip().rstrip(';')
+        select_additions = []
+
+        for expr, newname in self.computed_cols:
+            select_additions.append(f",\n       {expr} AS {q_ident(newname)}")
+
+        for expr, newname in self.lookup_cols:
+            select_additions.append(f",\n       {expr} AS {q_ident(newname)}")
+
+        joins_text = ""
+        if self.join_blocks:
+            joins_text = "\n" + "\n".join(self.join_blocks)
+
+        final = f"""CREATE OR ALTER VIEW {q_ident(self.schema + "." + self.view)} AS
+WITH base AS (
+{base_sql_clean}
+)
+SELECT base.*{"".join(select_additions)}
+FROM base{joins_text};
+"""
+        return final
+
+# =====================================================================
+# SECTION 3: FUNCTION 1 (COMPUTED COLUMN) - INDEPENDENT BUILDER
+# =====================================================================
+
+def function1_add_computed_column(conn: pyodbc.Connection, vctx: ViewBuildContext,
+                                  view_cols: List[Dict]) -> None:
+    """
+    Add a computed column based on existing view columns.
+    We avoid free-form parsing by offering clear builders:
+      A) Arithmetic: multi-term expression with operators
+      B) Text transforms: TRIM/UPPER/LOWER/LEFT/RIGHT/SUBSTRING/SPLIT
+      C) Date parts: YEAR/MONTH/DAY/HOUR/MINUTE/SECOND
+      D) CASE WHEN builder (simple comparison rules)
+    """
+    print("\n=== Function 1: Add Computed Column (Excel-like) ===")
+    # Display columns with numbers
+    print("\nCurrent View Columns:")
+    for c in view_cols:
+        print(f"{c['ordinal']:>3}) {c['name']}  ({c['data_type']})")
+
+    new_name = input("\nEnter NEW column name (e.g., NetAmount, MonthBucket): ").strip()
+    if not new_name:
+        log_warn("No name entered. Cancelled.")
+        return
+
+    # Mode menu
+    modes = [
+        "Arithmetic expression (+, -, *, /) with columns/literals",
+        "Text transforms (TRIM/UPPER/LOWER/LEFT/RIGHT/SUBSTRING/SPLIT)",
+        "Date part extraction (YEAR/MONTH/DAY/HOUR/MINUTE/SECOND)",
+        "CASE WHEN builder (simple conditions)"
+    ]
+    m = pick_from_numbered(modes, "Pick a builder")
+
+    if m == 0:
+        expr = build_arithmetic_expr(view_cols)
+    elif m == 1:
+        expr = build_text_expr(view_cols)
+    elif m == 2:
+        expr = build_datepart_expr(view_cols)
+    else:
+        expr = build_case_when_expr(view_cols)
+
+    if not expr:
+        log_warn("No expression produced. Cancelled.")
+        return
+
+    print("\nComputed Expression Preview:")
+    print(f"  {expr}  AS {q_ident(new_name)}")
+
+    if yn("Add this computed column to the view?", True):
+        vctx.add_computed(expr, new_name)
+        log_ok(f"Staged computed column [{new_name}]. Will apply on next 'Apply' step.")
+    else:
+        log_warn("Cancelled.")
+
+# ---- Function 1 sub-builders (independent helpers) -------------------
+
+def pick_column(view_cols: List[Dict], prompt="Pick a column") -> Dict:
+    """Pick a column by its ordinal number; returns the column dict."""
+    idx = pick_from_numbered([f"{c['name']} ({c['data_type']})" for c in view_cols], prompt)
+    return view_cols[idx]
+
+def build_arithmetic_expr(view_cols: List[Dict]) -> Optional[str]:
+    print("\nArithmetic Builder")
+    while True:
+        try:
+            n_terms = int(input("How many terms (2-6)? ").strip())
+            if 2 <= n_terms <= 6:
+                break
+            print("Enter a number between 2 and 6.")
+        except ValueError:
+            print("Enter a number.")
+
+    terms = []
+    for i in range(n_terms):
+        print(f"\nTerm #{i+1}:")
+        t = pick_from_numbered(["Column", "Numeric literal"], "Term type")
+        if t == 0:
+            col = pick_column(view_cols, "Choose column")
+            terms.append(q_ident(col['name']))
+        else:
+            lit = input("Enter numeric literal (e.g., 100, 3.14): ").strip()
+            # Basic validation
+            if not re.match(r"^-?\d+(\.\d+)?$", lit):
+                log_warn("Not numeric. Using 0.")
+                lit = "0"
+            terms.append(lit)
+
+    ops = []
+    for i in range(n_terms - 1):
+        op = pick_from_numbered(["+", "-", "*", "/"], f"Operator between term {i+1} and {i+2}")
+        ops.append(["+", "-", "*", "/"][op])
+
+    # Build expression with parentheses option
+    if yn("Wrap the whole expression in parentheses?", True):
+        expr = "(" + " ".join(t for pair in zip(terms, ops + [""]) for t in pair).strip() + ")"
+    else:
+        expr = " ".join(t for pair in zip(terms, ops + [""]) for t in pair).strip()
+
+    return expr
+
+def build_text_expr(view_cols: List[Dict]) -> Optional[str]:
+    print("\nText Transform Builder")
+    actions = [
+        "TRIM(column) -> LTRIM(RTRIM(col))",
+        "UPPER(column)",
+        "LOWER(column)",
+        "LEFT(column, length)",
+        "RIGHT(column, length)",
+        "SUBSTRING(column, start, length)   (1-based)",
+        "SPLIT by delimiter and take part index (1-based)"
+    ]
+    a = pick_from_numbered(actions, "Pick action")
+
+    col = pick_column(view_cols, "Choose a text column")
+    colname = q_ident(col['name'])
+
+    if a == 0:
+        return f"LTRIM(RTRIM({colname}))"
+    elif a == 1:
+        return f"UPPER({colname})"
+    elif a == 2:
+        return f"LOWER({colname})"
+    elif a == 3:
+        length = input("Enter length (int): ").strip()
+        length = length if length.isdigit() else "1"
+        return f"LEFT({colname}, {length})"
+    elif a == 4:
+        length = input("Enter length (int): ").strip()
+        length = length if length.isdigit() else "1"
+        return f"RIGHT({colname}, {length})"
+    elif a == 5:
+        start = input("Enter start (1-based int): ").strip()
+        length = input("Enter length (int): ").strip()
+        start = start if start.isdigit() else "1"
+        length = length if length.isdigit() else "1"
+        return f"SUBSTRING({colname}, {start}, {length})"
+    else:
+        delim = input("Delimiter (e.g., space -> ' '): ").strip()
+        if delim == "":
+            delim = " "
+        # Escape single quotes
+        delim_sql = delim.replace("'", "''")
+        idx = input("Take which part (1-based int): ").strip()
+        idx = idx if idx.isdigit() and int(idx) >= 1 else "1"
+        # SPLIT using CHARINDEX/SUBSTRING pattern (robust for SQL Server)
+        # We'll extract nth token delimited by delim.
+        # Simpler approach: replace delimiter with special marker and parse via STRING_SPLIT with ordinal (SQL 2022+).
+        # For general compatibility, do CROSS APPLY-free expression: use XML trick is overkill.
+        # We'll approximate: take token before the nth delimiter; for general nth, use PARSENAME trick if delim='.' only.
+        # To keep general, we’ll use a scalar hack via REPLACE: safer approach: call a small expression for first token only.
+        if idx == "1":
+            # first token before first delimiter
+            # If delimiter not found, return whole string
+            return (
+                f"CASE WHEN CHARINDEX('{delim_sql}', {colname}) > 0 "
+                f"THEN LEFT({colname}, CHARINDEX('{delim_sql}', {colname})-1) "
+                f"ELSE {colname} END"
+            )
+        else:
+            # For nth token, we’ll fallback to a generic split pattern using XML (works broadly)
+            # (CONVERT(XML,'<x>'+REPLACE(x,delim,'</x><x>')+'</x>')) to pick nth node
+            n = int(idx)
+            return (
+                f"TRY_CAST(SELECT TOP 1 T.C.value('.', 'nvarchar(max)') "
+                f"FROM (SELECT TRY_CONVERT(XML, '<x><v>' + REPLACE({colname}, '{delim_sql}', '</v><v>') + '</v></x>')) X(C) "
+                f"CROSS APPLY X.C.nodes('/x/v[{n}]') T(C) AS nvarchar(max))"
+            )
+
+def build_datepart_expr(view_cols: List[Dict]) -> Optional[str]:
+    print("\nDate Part Extract Builder")
+    parts = ["YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND"]
+    p = pick_from_numbered(parts, "Pick date part")
+    col = pick_column(view_cols, "Choose a datetime column")
+    return f"DATEPART({parts[p]}, {q_ident(col['name'])})"
+
+def build_case_when_expr(view_cols: List[Dict]) -> Optional[str]:
+    print("\nCASE WHEN Builder")
+    rules = []
+    while True:
+        print("\nDefine a WHEN condition:")
+        col = pick_column(view_cols, "Column to test")
+        ops = ["=", "<>", "<", "<=", ">", ">=", "BETWEEN", "LIKE", "IN (comma-separated)"]
+        o = pick_from_numbered(ops, "Operator")
+        col_sql = q_ident(col['name'])
+        if ops[o] == "BETWEEN":
+            v1 = input("Value 1: ").strip()
+            v2 = input("Value 2: ").strip()
+            cond = f"{col_sql} BETWEEN {literal_sql(v1)} AND {literal_sql(v2)}"
+        elif ops[o] == "LIKE":
+            v = input("Pattern (e.g., %abc%): ").strip()
+            cond = f"{col_sql} LIKE {literal_sql(v)}"
+        elif ops[o].startswith("IN"):
+            v = input("Values (comma-separated): ").strip()
+            vals = ", ".join(literal_sql(x.strip()) for x in v.split(",") if x.strip() != "")
+            cond = f"{col_sql} IN ({vals})"
+        else:
+            v = input("Value: ").strip()
+            cond = f"{col_sql} {ops[o]} {literal_sql(v)}"
+
+        then_val = input("THEN value (e.g., 'High', 1, NULL): ").strip()
+        then_sql = literal_sql(then_val, allow_null=True)
+
+        rules.append((cond, then_sql))
+        if not yn("Add another WHEN?", False):
+            break
+
+    else_val = input("ELSE value (e.g., 'Low', 0, NULL): ").strip()
+    else_sql = literal_sql(else_val, allow_null=True)
+
+    lines = ["CASE"]
+    for cond, then_ in rules:
+        lines.append(f"  WHEN {cond} THEN {then_}")
+    lines.append(f"  ELSE {else_sql}")
+    lines.append("END")
+    return "\n".join(lines)
+
+def literal_sql(v: str, allow_null=False) -> str:
+    """
+    Turn a Python string input into a SQL literal: numeric stays numeric, NULL literal supported, else quoted.
+    """
+    if allow_null and v.upper() == "NULL":
+        return "NULL"
+    if re.match(r"^-?\d+(\.\d+)?$", v):  # numeric
+        return v
+    # else quote as NVARCHAR
+    return "N'" + v.replace("'", "''") + "'"
+
+# =====================================================================
+# SECTION 4: FUNCTION 2 (LOOKUP FROM TABLE) - INDEPENDENT BUILDER
+# =====================================================================
+
+def function2_add_lookup_column(conn: pyodbc.Connection, vctx: ViewBuildContext,
+                                view_cols: List[Dict]) -> None:
+    """
+    Add a lookup-derived column by joining another table.
+    Modes:
+      - Equality lookup: base.col = T.col
+      - Time-range lookup: base.dt BETWEEN T.Start AND T.End (exclusive end default)
+    """
+    print("\n=== Function 2: Add Lookup Column from Another Table ===")
+
+    # List tables
+    tables = fetch_tables(conn)
+    if not tables:
+        log_warn("No user tables found.")
+        return
+
+    tbl_idx = pick_from_numbered([f"{s}.{t}" for s, t in tables], "Pick a table")
+    tschema, tname = tables[tbl_idx]
+    tcols = fetch_columns_for_table(conn, tschema, tname)
+    if not tcols:
+        log_warn("Table has no columns?!")
+        return
+
+    # New column name
+    new_name = input("\nEnter NEW column name to add to view (e.g., FinancialMonth): ").strip()
+    if not new_name:
+        log_warn("No name entered. Cancelled.")
+        return
+
+    modes = ["Equality lookup (base.col = table.col)", "Time-range lookup (base.dt between Start/End)"]
+    m = pick_from_numbered(modes, "Pick lookup mode")
+
+    # Will build a join/apply block with an alias
+    jalias = vctx.next_join_alias()
+
+    if m == 0:
+        # Equality lookup
+        print("\nPick base(view) column:")
+        bcol = pick_column(view_cols, "Base column")
+        print("\nPick table column to match:")
+        tcol_match = pick_from_numbered([f"{c['name']} ({c['data_type']})" for c in tcols], "Table match column")
+        tmatch = tcols[tcol_match]
+        print("\nPick TABLE column to return as value:")
+        tcol_ret = pick_from_numbered([f"{c['name']} ({c['data_type']})" for c in tcols], "Return column")
+        tret = tcols[tcol_ret]
+
+        # LEFT JOIN block
+        join_block = (
+            f"LEFT JOIN {q_ident(tschema + '.' + tname)} {jalias} "
+            f"ON {q_ident('base.' + bcol['name'])} = {q_ident(jalias + '.' + tret['name']) if tmatch['name']==tret['name'] else q_ident(jalias + '.' + tmatch['name'])}"
+        )
+        # Select expr is alias.returncol
+        ret_expr = f"{q_ident(jalias + '.' + tret['name'])}"
+
+        print("\nLookup Preview:")
+        print(join_block)
+        print(f"SELECT ..., {ret_expr} AS {q_ident(new_name)}")
+
+        if yn("Add this lookup to the view?", True):
+            vctx.add_lookup(join_block, ret_expr, new_name)
+            log_ok(f"Staged lookup column [{new_name}] from {tschema}.{tname}.")
+        else:
+            log_warn("Cancelled.")
+        return
+
+    else:
+        # Time-range
+        print("\nPick base(view) DATETIME column:")
+        bdt = pick_column(view_cols, "Base datetime column")
+        if not is_datetime_type(bdt['data_type']):
+            log_warn(f"Warning: {bdt['name']} is {bdt['data_type']}, not a datetime type.")
+
+        print("\nPick TABLE StartTime column:")
+        tstart_idx = pick_from_numbered(
+            [f"{c['name']} ({c['data_type']})" for c in tcols], "StartTime column"
+        )
+        tstart = tcols[tstart_idx]
+
+        print("\nPick TABLE EndTime column:")
+        tend_idx = pick_from_numbered(
+            [f"{c['name']} ({c['data_type']})" for c in tcols], "EndTime column"
+        )
+        tend = tcols[tend_idx]
+
+        print("\nPick TABLE Return (notation) column:")
+        tret_idx = pick_from_numbered(
+            [f"{c['name']} ({c['data_type']})" for c in tcols], "Return column"
+        )
+        tret = tcols[tret_idx]
+
+        inclusive_end = yn("Use inclusive EndTime (<=) ? Default is exclusive (<)", False)
+
+        # We'll use OUTER APPLY with TOP (1) to guarantee single row returned (no fanout)
+        comp = "<=" if inclusive_end else "<"
+        join_block = (
+            f"OUTER APPLY (\n"
+            f"    SELECT TOP (1) {q_ident('T.' + tret['name'])} AS RetVal\n"
+            f"    FROM {q_ident(tschema + '.' + tname)} AS T\n"
+            f"    WHERE {q_ident('base.' + bdt['name'])} >= {q_ident('T.' + tstart['name'])}\n"
+            f"      AND {q_ident('base.' + bdt['name'])} {comp} {q_ident('T.' + tend['name'])}\n"
+            f"    ORDER BY {q_ident('T.' + tstart['name'])} DESC\n"
+            f") {jalias}"
+        )
+        ret_expr = f"{q_ident(jalias + '.RetVal')}"
+
+        print("\nTime-range Lookup Preview:")
+        print(join_block)
+        print(f"SELECT ..., {ret_expr} AS {q_ident(new_name)}")
+
+        if yn("Add this time-range lookup to the view?", True):
+            vctx.add_lookup(join_block, ret_expr, new_name)
+            log_ok(f"Staged time-range lookup column [{new_name}] from {tschema}.{tname}.")
+        else:
+            log_warn("Cancelled.")
+        return
+
+# =====================================================================
+# SECTION 5: APPLY CHANGES (PREVIEW + EXECUTE IN TXN)
+# =====================================================================
+
+def apply_changes(conn: pyodbc.Connection, vctx: ViewBuildContext):
+    """
+    Fetch current view SQL, back it up, build final SQL, preview and apply.
+    """
+    base_sql = get_view_definition(conn, vctx.schema, vctx.view)
+    backup_sql_text(vctx.schema, vctx.view, base_sql)
+
+    new_sql = vctx.build_create_or_alter(base_sql)
+
+    print("\n===================== SQL PREVIEW =====================")
+    print(new_sql)
+    print("=======================================================\n")
+
+    if not yn("Apply this ALTER VIEW now?", True):
+        log_warn("Apply cancelled.")
+        return
+
+    cur = conn.cursor()
+    try:
+        log_info("Applying...")
+        cur.execute(new_sql)
+        conn.commit()
+        log_ok("View updated successfully.")
+    except Exception as e:
+        conn.rollback()
+        log_err(f"Apply failed, rolled back. Error: {e}")
+        return
+
+    # Clear staged changes because they are applied now
+    vctx.computed_cols.clear()
+    vctx.join_blocks.clear()
+    vctx.lookup_cols.clear()
+    vctx.join_counter = 0
+
+def show_sample(conn: pyodbc.Connection, schema: str, view: str, top_n: int = PREVIEW_TOP_N):
+    sql = f"SELECT TOP ({top_n}) * FROM {q_ident(schema + '.' + view)};"
+    cur = conn.cursor()
+    try:
+        rows = cur.execute(sql).fetchmany(top_n)
+    except Exception as e:
+        log_err(f"Sample failed: {e}")
+        return
+    cols = [d[0] for d in cur.description] if cur.description else []
+    print("\nSample rows:")
+    if not rows:
+        print("  (no rows)")
+        return
+    # pretty print
+    print(" | ".join(cols))
+    print("-" * 80)
+    for r in rows:
+        print(" | ".join(str(x) if x is not None else "NULL" for x in r))
+
+# =====================================================================
+# SECTION 6: MAIN MENU & FLOW
+# =====================================================================
+
+def main():
+    # Connect
+    try:
+        conn = connect_mssql(SERVER, DATABASE, AUTH_MODE, SQL_USERNAME)
+    except Exception as e:
+        log_err(f"Connection failed: {e}")
+        sys.exit(1)
+
+    # Pick view
+    views = fetch_views(conn)
+    if not views:
+        log_warn("No user views found in this database.")
+        return
+
+    print("\nAvailable Views:")
+    v_idx = pick_from_numbered([f"{s}.{v}" for s, v in views], "Pick a view")
+    vschema, vname = views[v_idx]
+    log_ok(f"Selected view: {vschema}.{vname}")
+
+    # Show columns
+    view_cols = fetch_columns_for_view(conn, vschema, vname)
+    if not view_cols:
+        log_warn("View has no visible columns (unexpected).")
+    else:
+        print("\nColumns in view:")
+        for c in view_cols:
+            print(f"{c['ordinal']:>3}) {c['name']}  ({c['data_type']})")
+
+    # Build context (holds staged changes until Apply)
+    vctx = ViewBuildContext(vschema, vname)
+
+    # Main loop
+    while True:
+        print("\n=== Main Menu ===")
+        print(" 1) Add Computed Column (Function 1)")
+        print(" 2) Add Lookup Column from Another Table (Function 2)")
+        print(" 3) Apply changes (CREATE OR ALTER VIEW)")
+        print(" 4) Refresh & show current columns")
+        print(" 5) Show TOP sample from current view")
+        print(" 0) Exit")
+
+        choice = input("Choose: ").strip()
+        if choice == "1":
+            # refetch columns so numbering stays fresh (after prior applies)
+            view_cols = fetch_columns_for_view(conn, vschema, vname)
+            function1_add_computed_column(conn, vctx, view_cols)
+        elif choice == "2":
+            view_cols = fetch_columns_for_view(conn, vschema, vname)
+            function2_add_lookup_column(conn, vctx, view_cols)
+        elif choice == "3":
+            apply_changes(conn, vctx)
+        elif choice == "4":
+            view_cols = fetch_columns_for_view(conn, vschema, vname)
+            print("\nColumns in view:")
+            for c in view_cols:
+                print(f"{c['ordinal']:>3}) {c['name']}  ({c['data_type']})")
+        elif choice == "5":
+            show_sample(conn, vschema, vname, PREVIEW_TOP_N)
+        elif choice == "0":
+            log_info("Bye.")
+            break
+        else:
+            print("Enter 0..5.")
+
+    try:
+        conn.close()
+    except Exception:
+        pass
+
+# =====================================================================
+
+if __name__ == "__main__":
+    main()
